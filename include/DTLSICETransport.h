@@ -51,7 +51,9 @@ public:
 	class Listener
 	{
 	public:
+		virtual void onICETimeout() = 0;
 		virtual void onDTLSStateChanged(const DTLSState) = 0;
+		virtual void onRemoteICECandidateActivated(const std::string& ip, uint16_t port, uint32_t priority) = 0;
 		virtual ~Listener() = default;
 	};
 	class Sender
@@ -73,9 +75,11 @@ public:
 	virtual int SendPLI(DWORD ssrc) override;
 	virtual int Enqueue(const RTPPacket::shared& packet) override;
 	virtual int Enqueue(const RTPPacket::shared& packet,std::function<RTPPacket::shared(const RTPPacket::shared&)> modifier) override;
-	int Dump(const char* filename, bool inbound = true, bool outbound = true, bool rtcp = true);
-	int Dump(UDPDumper* dumper, bool inbound = true, bool outbound = true, bool rtcp = true);
+	int Dump(const char* filename, bool inbound = true, bool outbound = true, bool rtcp = true, bool rtpHeadersOnly = false);
+	int Dump(UDPDumper* dumper, bool inbound = true, bool outbound = true, bool rtcp = true, bool rtpHeadersOnly = false);
+	int StopDump();
         int DumpBWEStats(const char* filename);
+	int StopDumpBWEStats();
 	void Reset();
 	
 	void ActivateRemoteCandidate(ICERemoteCandidate* candidate,bool useCandidate, DWORD priority);
@@ -90,6 +94,7 @@ public:
 	
 	void SetBandwidthProbing(bool probe);
 	void SetMaxProbingBitrate(DWORD bitrate)	{ this->maxProbingBitrate = bitrate;	}
+	void SetProbingBitrateLimit(DWORD bitrate)	{ this->probingBitrateLimit = bitrate;	}
 	void SetSenderSideEstimatorListener(RemoteRateEstimator::Listener* listener) { senderSideBandwidthEstimator.SetListener(listener); }
 	
 	const char* GetRemoteUsername() const { return iceRemoteUsername;	};
@@ -174,22 +179,28 @@ private:
 	
 	Acumulator incomingBitrate;
 	Acumulator outgoingBitrate;
+	Acumulator rtxBitrate;
 	Acumulator probingBitrate;
 	
 	std::map<DWORD,PacketStats::shared> transportWideReceivedPacketsStats;
 	
-	UDPDumper* dumper	= nullptr;
-	bool dumpInRTP		= false;
-	bool dumpOutRTP		= false;
-	bool dumpRTCP		= false;
-	volatile bool probe	= false;
-	DWORD maxProbingBitrate = 1024*1000;
+	UDPDumper* dumper		= nullptr;
+	bool dumpInRTP			= false;
+	bool dumpOutRTP			= false;
+	bool dumpRTCP			= false;
+	bool dumpRTPHeadersOnly		= false;
+	volatile bool probe		= false;
+	DWORD maxProbingBitrate		= 1024*1000;
+	DWORD probingBitrateLimit	= maxProbingBitrate *4;
 	
 	Timer::shared probingTimer;
 	QWORD   lastProbe = 0;
 	QWORD 	initTime = 0;
+	bool	started = false;
 	
 	SendSideBandwidthEstimation senderSideBandwidthEstimator;
+	
+	Timer::shared iceTimeoutTimer;
 };
 
 

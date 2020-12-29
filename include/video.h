@@ -3,6 +3,16 @@
 #include "config.h"
 #include "media.h"
 #include "codecs.h"
+#include "rtp/LayerInfo.h"
+
+struct LayerFrame
+{
+	DWORD pos	= 0;
+	DWORD size	= 0;
+	DWORD width	= 0;
+	DWORD height	= 0;
+	LayerInfo info;
+};
 
 class VideoFrame : public MediaFrame
 {
@@ -40,31 +50,42 @@ public:
 		frame->SetClockRate(GetClockRate());
 		//Set timestamp
 		frame->SetTimestamp(GetTimeStamp());
+		//Set time
+		frame->SetTime(GetTime());
+		frame->SetSenderTime(GetSenderTime());
 		//Set duration
 		frame->SetDuration(GetDuration());
+		//If we have disabled the shared buffer for this frame
+		if (disableSharedBuffer)
+			//Copy data
+			frame->AdquireBuffer();
 		//Set config
 		if (HasCodecConfig()) frame->SetCodecConfig(GetCodecConfigData(),GetCodecConfigSize());
 		//Check if it has rtp info
-		for (auto it = rtpInfo.begin();it!=rtpInfo.end();++it)
-		{
-			//Gete info
-			const MediaFrame::RtpPacketization *rtp = (*it);
+		for (const auto& rtp : rtpInfo)
 			//Add it
-			frame->AddRtpPacket(rtp->GetPos(),rtp->GetSize(),rtp->GetPrefixData(),rtp->GetPrefixLen());
-		}
+			frame->AddRtpPacket(rtp.GetPos(),rtp.GetSize(),rtp.GetPrefixData(),rtp.GetPrefixLen());
+		//Check if it has layers
+		for (const auto& layer : layers)
+			//Add it
+			frame->AddLayerFrame(layer);
 		//Return it
 		return (MediaFrame*)frame;
 	}
 	
-	VideoCodec::Type GetCodec()	{ return codec;			}
-	bool  IsIntra()			{ return isIntra;		}
-	DWORD GetWidth()		{ return width;			}
-	DWORD GetHeight()		{ return height;		}
+	VideoCodec::Type GetCodec() const	{ return codec;			}
+	bool  IsIntra()	const			{ return isIntra;		}
+	DWORD GetWidth() const			{ return width;			}
+	DWORD GetHeight() const			{ return height;		}
 
 	void SetCodec(VideoCodec::Type codec)	{ this->codec = codec;		}
 	void SetWidth(DWORD width)		{ this->width = width;		}
 	void SetHeight(DWORD height)		{ this->height = height;	}
 	void SetIntra(bool isIntra)		{ this->isIntra = isIntra;	}
+	
+	bool	HasLayerFrames() const				{ return !layers.empty();	}
+	const std::vector<LayerFrame>& GetLayerFrames() const	{ return layers;		}
+	void AddLayerFrame(const LayerFrame& layer)		{ layers.push_back(layer);	}
 	
 	void Reset() 
 	{
@@ -74,6 +95,8 @@ public:
 		SetIntra(false);
 		//No new config
 		ClearCodecConfig();
+		//Clear layers
+		layers.clear();
 	}
 	
 private:
@@ -81,6 +104,7 @@ private:
 	bool	isIntra;
 	DWORD	width;
 	DWORD	height;
+	std::vector<LayerFrame> layers;
 
 };
 
@@ -94,7 +118,12 @@ struct VideoBuffer
 		this->buffer = buffer;
 	}
 	
-	DWORD GetBufferSize()
+	BYTE* GetBufferData() const
+	{
+		return buffer;
+	}
+	
+	DWORD GetBufferSize() const
 	{
 		return (width*height*3)/2;
 	}
@@ -143,7 +172,7 @@ public:
 
 	virtual int GetWidth()=0;
 	virtual int GetHeight()=0;
-	virtual int Decode(BYTE *in,DWORD len) = 0;
+	virtual int Decode(const BYTE *in,DWORD len) = 0;
 	virtual int DecodePacket(const BYTE *in,DWORD len,int lost,int last)=0;
 	virtual BYTE* GetFrame()=0;
 	virtual bool  IsKeyFrame()=0;

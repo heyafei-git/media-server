@@ -51,7 +51,9 @@ private:
 		TimerImpl(const TimerImpl&) = delete;
 		virtual void Cancel() override;
 		virtual void Again(const std::chrono::milliseconds& ms) override;
-		virtual std::chrono::milliseconds GetRepeat() const override { return repeat; };
+		virtual bool IsScheduled()			const override { return next.count();	}
+		virtual std::chrono::milliseconds GetNextTick()	const override { return next;		}
+		virtual std::chrono::milliseconds GetRepeat()	const override { return repeat;		}
 		
 		EventLoop&		  loop;
 		std::chrono::milliseconds next;
@@ -63,7 +65,7 @@ public:
 	virtual ~EventLoop();
 	
 	bool Start(std::function<void(void)> loop);
-	bool Start(int fd);
+	bool Start(int fd = FD_INVALID);
 	bool Stop();
 	
 	virtual const std::chrono::milliseconds GetNow() const override { return now; }
@@ -76,6 +78,8 @@ public:
 	void Run(const std::chrono::milliseconds &duration = std::chrono::milliseconds::max());
 	
 	bool SetAffinity(int cpu);
+	
+	bool IsRunning() const { return running; }
 	
 protected:
 	void Signal();
@@ -97,17 +101,18 @@ private:
 		uint16_t port;
 		Packet   packet;
 	};
-	static size_t MaxSendingQueueSize;
+	static const size_t MaxSendingQueueSize;
+	static const size_t MaxMultipleSendingMessages;
 private:
 	std::thread	thread;
-	State		state = State::Normal;
-	Listener*	listener = nullptr;
-	int		fd = 0;
-	int		pipe[2] = {};
-	pollfd		ufds[2] = {};
-	volatile bool	signaled = false;
-	volatile bool	running = false;
-	std::chrono::milliseconds now = 0ms;
+	State		state		= State::Normal;
+	Listener*	listener	= nullptr;
+	int		fd		= 0;
+	int		pipe[2]		= {FD_INVALID, FD_INVALID};
+	pollfd		ufds[2]		= {};
+	volatile bool	signaled	= false;
+	volatile bool	running		= false;
+	std::chrono::milliseconds now	= 0ms;
 	moodycamel::ConcurrentQueue<SendBuffer>	sending;
 	moodycamel::ConcurrentQueue<std::pair<std::promise<void>,std::function<void(std::chrono::milliseconds)>>>  tasks;
 	std::multimap<std::chrono::milliseconds,TimerImpl::shared> timers;

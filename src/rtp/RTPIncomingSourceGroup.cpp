@@ -77,10 +77,12 @@ int RTPIncomingSourceGroup::AddPacket(const RTPPacket::shared &packet, DWORD siz
 	//Get now
 	auto now = getTimeMS();
 	
+	//Update instant lost accumulator
+	if (lost) media.AddLostPackets(now, lost);
+	
 	//If doing remb
 	if (remb)
 	{
-		
 		//Add estimation
 		remoteRateEstimator.Update(media.ssrc,packet,size);
 		//Update lost
@@ -110,8 +112,6 @@ void RTPIncomingSourceGroup::Bye(DWORD ssrc)
 {
 	if (ssrc == media.ssrc)
 	{
-		//Reset source
-		media.Reset();
 		//REset packets
 		ResetPackets();
 		//Reset 
@@ -124,11 +124,7 @@ void RTPIncomingSourceGroup::Bye(DWORD ssrc)
 				listener->onBye(this);
 		}
 	} else if (ssrc == rtx.ssrc) {
-		//Reset source
-		rtx.Reset();
 	} else if (ssrc == fec.ssrc) {
-		//Reset source
-		fec.Reset();
 	}
 }
 
@@ -137,11 +133,6 @@ void RTPIncomingSourceGroup::ResetPackets()
 	//Reset packet queue and lost count
 	packets.Reset();
 	losts.Reset();
-	//Reset stats
-	lost = 0;
-	minWaitedTime = 0;
-	maxWaitedTime = 0;
-	avgWaitedTime = 0;
 }
 
 void RTPIncomingSourceGroup::Update()
@@ -155,28 +146,24 @@ void RTPIncomingSourceGroup::Update(QWORD now)
 	{
 		//Lock source
 		ScopedLock scoped(media);
-		//Update bitrate accumulator
-		media.acumulator.Update(now);
-		//Update also all media layers
-		for (auto& entry : media.layers)
-			//Update bitrate also
-			entry.second.acumulator.Update(now);
+		//Update
+		media.Update(now);
 	}
 	
 	//Update RTX
 	{
 		//Lock source
 		ScopedLock scoped(rtx);
-		//Update bitrate accumulator
-		rtx.acumulator.Update(now);
+		//Update
+		rtx.Update(now);
 	}
 	
 	//Update FEC
 	{
 		//Lock source
 		ScopedLock scoped(fec);
-		//Update bitrate accumulator
-		fec.acumulator.Update(now);
+		//Update
+		fec.Update(now);
 	}
 }
 
@@ -185,7 +172,7 @@ void RTPIncomingSourceGroup::SetRTT(DWORD rtt)
 	//Store rtt
 	this->rtt = rtt;
 	//Set max packet wait time
-	packets.SetMaxWaitTime(fmin(500,fmax(120,rtt*4)+40));
+	packets.SetMaxWaitTime(fmin(500,fmax(120,rtt)*2));
 	//Dispatch packets with new timer now
 	dispatchTimer->Again(0ms);
 	//If using remote rate estimator
@@ -278,6 +265,26 @@ RTPIncomingSource* RTPIncomingSourceGroup::Process(RTPPacket::shared &packet)
 	if (!source)
 		//error
 		return nullptr;
+	
+	//Set extendedd  timestamp
+	packet->SetTimestampCycles(source->ExtendTimestamp(packet->GetTimestamp()));
+	//Set cycles back
+	packet->SetSeqCycles(source->ExtendSeqNum(packet->GetSeqNum()));
+	
+	//Parse dependency structure now
+	if (packet->ParseDependencyDescriptor(templateDependencyStructure,activeDecodeTargets))
+	{
+		//If it has a new dependency structure
+		if (packet->HasTemplateDependencyStructure())
+		{
+			//Store it
+			templateDependencyStructure = packet->GetTemplateDependencyStructure();
+			activeDecodeTargets = packet->GetActiveDecodeTargets();
+		}
+	}
+	
+	//Set clockrate
+	source->clockrate = packet->GetClockRate();
 
 	//if it is video
 	if (type == MediaFrame::Video)
@@ -296,12 +303,8 @@ RTPIncomingSource* RTPIncomingSourceGroup::Process(RTPPacket::shared &packet)
 		source->Update(time, packet->GetSeqNum(), packet->GetRTPHeader().GetSize() + packet->GetMediaLength());
 	}
 	
-	//Update source sequence number and get cycles
-	WORD cycles = source->SetSeqNum(packet->GetSeqNum());
-
-	//Set cycles back
-	packet->SetSeqCycles(cycles);
-	
+	if (source==&media)
+		source->SetLastTimestamp(time, packet->GetExtTimestamp());
 	//Done
 	return source;
 }

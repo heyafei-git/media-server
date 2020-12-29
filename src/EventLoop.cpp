@@ -15,14 +15,33 @@
 
 #include "log.h"
 
-size_t EventLoop::MaxSendingQueueSize = 16*1024;
+const size_t EventLoop::MaxSendingQueueSize = 16*1024;
 
 
 #if __APPLE__
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
+const size_t EventLoop::MaxMultipleSendingMessages = 1;
+
+struct mmsghdr
+{
+	struct msghdr msg_hdr;	/* Actual message header.  */
+	unsigned int msg_len;	/* Number of received or sent bytes for the entry.  */
+};
+
+ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
+ {
+	 int ret = 0;
+	 for (unsigned int len = 0; len<vlen; ++len)
+		 ret += (msgvec[len].msg_len = sendmsg(sockfd, &msgvec[len].msg_hdr, flags ))>0;
+	 return ret;
+ }
 #else
+#include <linux/errqueue.h>
 #include <sys/eventfd.h>
+
+const size_t EventLoop::MaxMultipleSendingMessages = 10;
+
 cpu_set_t* alloc_cpu_set(size_t* size) {
 	// the CPU set macros don't handle cases like my Azure VM, where there are 2 cores, but 128 possible cores (why???)
 	// hence requiring an oversized 16 byte cpu_set_t rather than the 8 bytes that the macros assume to be sufficient.
@@ -51,7 +70,8 @@ EventLoop::EventLoop(Listener *listener) :
 
 EventLoop::~EventLoop()
 {
-	Stop();
+	if (running)
+		Stop();
 }
 
 bool EventLoop::SetAffinity(int cpu)
@@ -86,6 +106,14 @@ bool EventLoop::SetAffinity(int cpu)
 	//Clear cpu mask
 	free_cpu_set(cpuSet);
 	
+#ifdef 	SO_INCOMING_CPU
+	//If got socket
+	if (fd)
+		//Set incoming socket cpu affinity
+		setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu));
+#endif
+
+	
 	//Done
 	return ret;
 #endif
@@ -94,9 +122,13 @@ bool EventLoop::SetAffinity(int cpu)
 bool EventLoop::Start(std::function<void(void)> loop)
 {
 	//If already started
-	if (thread.get_id()!=std::thread::id())
-		//Alredy running
-		return false;
+	if (running)
+		//Stop first
+		Stop();
+	
+	//Log
+	Debug("-EventLoop::Start()\n");
+	
 #if __APPLE__
 	//Create pipe
 	if (::pipe(pipe)==-1)
@@ -110,9 +142,13 @@ bool EventLoop::Start(std::function<void(void)> loop)
 #else
 	pipe[0] = pipe[1] = eventfd(0, EFD_NONBLOCK);
 #endif	
-	
+	//Check values
+	if (pipe[0]==FD_INVALID || pipe[1]==FD_INVALID)
+		//Error
+		return Error("-EventLoop::Start() | could not start pipe [errno:%d]\n",errno);
+			
 	//Store socket
-	this->fd = -1;
+	this->fd = FD_INVALID;
 	
 	//Running
 	running = true;
@@ -127,9 +163,12 @@ bool EventLoop::Start(std::function<void(void)> loop)
 bool EventLoop::Start(int fd)
 {
 	//If already started
-	if (thread.get_id()!=std::thread::id())
-		//Alredy running
-		return false;
+	if (running)
+		//Alredy running, Run() doesn't exit so Stop() must be called explicitly
+		return Error("-EventLoop::Start() | Already running\n");
+	
+	//Log
+	Debug("-EventLoop::Start() [fd:%d]\n",fd);
 	
 #if __APPLE__
 	//Create pipe
@@ -144,6 +183,10 @@ bool EventLoop::Start(int fd)
 #else
 	pipe[0] = pipe[1] = eventfd(0, EFD_NONBLOCK);
 #endif	
+	//Check values
+	if (pipe[0]==FD_INVALID || pipe[1]==FD_INVALID)
+		//Error
+		return Error("-EventLoop::Start() | could not start pipe [errno:%d]\n",errno);
 	
 	//Store socket
 	this->fd = fd;
@@ -163,7 +206,10 @@ bool EventLoop::Stop()
 	//Check if running
 	if (!running)
 		//Nothing to do
-		return false;
+		return Error("-EventLoop::Stop() | Already stopped");
+	
+	//Log
+	Debug(">EventLoop::Stop() [fd:%d]\n",fd);
 	
 	//Not running
 	running = false;
@@ -179,11 +225,14 @@ bool EventLoop::Stop()
 	}
 	
 	//Close pipe
-	close(pipe[0]);
-	close(pipe[1]);
+	if (pipe[0]!=FD_INVALID) close(pipe[0]);
+	if (pipe[1]!=FD_INVALID) close(pipe[1]);
 	
 	//Empyt pipe
-	pipe[0] = pipe[1] = 0;
+	pipe[0] = pipe[1] = FD_INVALID;
+	
+	//Log
+	Debug("<EventLoop::Stop() [fd:%d]\n",fd);
 	
 	//Done
 	return true;
@@ -214,8 +263,8 @@ void EventLoop::Send(const uint32_t ipAddr, const uint16_t port, Packet&& packet
 		//Log
 		Error("-EventLoop::Send() | sending queue lagging behind [aprox:%u]\n",aprox);
 	} else if (aprox<MaxSendingQueueSize/4 && state!=State::Normal)  {
-		//We are lagging behind
-		state = State::Lagging;
+		//We are normal again
+		state = State::Normal;
 		//Log
 		Log("-EventLoop::Send() | sending queue back to normal [aprox:%u]\n",aprox);
 	}
@@ -374,8 +423,8 @@ void EventLoop::Signal()
 	//UltraDebug("-EventLoop::Signal()\r\n");
 	uint64_t one = 1;
 	
-	//If we are in the same thread or already signaled
-	if (std::this_thread::get_id()==thread.get_id() || signaled) 
+	//If we are in the same thread or already signaled and pipe is ok
+	if (std::this_thread::get_id()==thread.get_id() || signaled || pipe[1]==FD_INVALID)
 		//No need to do anything
 		return;
 	
@@ -395,12 +444,18 @@ void EventLoop::Run(const std::chrono::milliseconds &duration)
 	//Recv data
 	uint8_t data[MTU] ZEROALIGNEDTO32;
 	size_t  size = MTU;
-	sockaddr_in from;
-	memset(&from,0,sizeof(sockaddr_in));
+	struct sockaddr_in from = {};
+	
+	//Multiple messages struct
+	struct mmsghdr messages[MaxMultipleSendingMessages] = {};
+	struct sockaddr_in tos[MaxMultipleSendingMessages] = {};
+	struct iovec iovs[MaxMultipleSendingMessages][1] = {};
+	
+	//UDP send flags
+	uint32_t flags = MSG_DONTWAIT;
 	
 	//Pending data
-	SendBuffer item;
-	bool pending = false;
+	std::vector<SendBuffer> items(MaxMultipleSendingMessages);
 	
 	//Set values for polling
 	ufds[0].fd = fd;
@@ -412,7 +467,28 @@ void EventLoop::Run(const std::chrono::milliseconds &duration)
 	int fsflags = fcntl(fd,F_GETFL,0);
 	fsflags |= O_NONBLOCK;
 	fcntl(fd,F_SETFL,fsflags);
+
+
+#ifdef MSG_ZEROCOPY_ENABLED
+//You can't use MSG_ZEROCOPY if tx-scatter-gather-fraglist is off
+//Only available for UDP on Linux 5.0 so disabling this for now		
+	bool zerocopyEnabled = false;
+	std::map<uint32_t,Packet> zerocopy;
+	uint32_t zerocopyIndex = 0;
 	
+	//Enable zero copy
+	int one = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one))==0)
+	{
+		//Enable it
+		zerocopyEnabled = true;
+		//Set flag
+		flags |= MSG_ZEROCOPY;
+	} else {
+		//Error
+		Error("-EventLoop::Run() | could not start zerocopy [errno:%d]\n",errno);
+	}
+#endif
 	//Catch all IO errors and do nothing
 	signal(SIGIO,[](int){});
 	
@@ -427,6 +503,9 @@ void EventLoop::Run(const std::chrono::milliseconds &duration)
 	{
 		//If we have anything to send set to wait also for write events
 		ufds[0].events = sending.size_approx() ? POLLIN | POLLOUT | POLLERR | POLLHUP : POLLIN | POLLERR | POLLHUP;
+		//Clear readed events
+		ufds[0].revents = 0;
+		ufds[1].revents = 0;
 		
 		//Until signaled
 		int timeout = -1;
@@ -461,12 +540,72 @@ void EventLoop::Run(const std::chrono::milliseconds &duration)
 		now = Now();
 		
 		//UltraDebug("<EventLoop::Run() | poll timeout:%d timers:%d tasks:%d\n",timeout,timers.size(),tasks.size_approx());
-		
+
+#ifdef MSG_ZEROCOPY_ENABLED
+		//Check err queue
+		if  (zerocopyEnabled && ufds[0].revents & POLLERR)
+		{
+			UltraDebug("-EventLoop::Run() | ufds[0].revents & POLLERR\n");
+						
+			struct msghdr msg		= {};
+			struct sock_extended_err* serr	= nullptr;
+			struct cmsghdr* cm		= nullptr;
+			
+			//Read from message queue
+			int ret = recvmsg(fd, &msg, MSG_ERRQUEUE);
+			Log("-EventLoop::Run() | ret=%d\n",ret);
+			//If error
+			if (ret<0)
+			{
+				//Error
+				Log("-EventLoop::Run() | Pool error event [revents:%d,errno:%d,recvmsg]\n",ufds[0].revents,errno);
+				//Exit
+				//break;
+			} else {
+				Log("-EventLoop::Run() | CMSG_FIRSTHDR\n");
+				//Get first 
+				cm = CMSG_FIRSTHDR(&msg);
+
+				if (cm)
+				{
+					//If it
+					if (cm->cmsg_level != SOL_IP &&	cm->cmsg_type != IP_RECVERR)
+					{
+						//Error
+						Log("-EventLoop::Run() | Pool error event [revents:%d,errno:%d,cmsg]\n",ufds[0].revents,errno);
+						//Exit
+						break;
+					}
+					Log("-EventLoop::Run() | CMSG_DATA\n");
+					//Get message data
+					serr = (sock_extended_err*) CMSG_DATA(cm);
+					//Check it is the zero copy id
+					if (serr->ee_errno != 0 || serr->ee_origin != SO_EE_ORIGIN_ZEROCOPY)
+					{
+						//Error
+						Log("-EventLoop::Run() | Pool error event [revents:%d,errno:%d,serr]\n",ufds[0].revents,errno);
+						//Exit
+						break;
+					}
+					//Get id
+					uint32_t id = serr->ee_data;
+
+					//Erase it
+					Log("-EventLoop::Run() | erase\n");
+					zerocopy.erase(id);
+					Log("-zci %u\n",id);
+				}
+			}
+
+		}
+		//Check for cancel
+		else
+#endif 			
 		//Check for cancel
 		if ((ufds[0].revents & POLLHUP) || (ufds[0].revents & POLLERR) || (ufds[1].revents & POLLHUP) || (ufds[1].revents & POLLERR))
 		{
 			//Error
-			Log("-EventLoop::Run() | Pool error event [%d]\n",ufds[0].revents);
+			Log("-EventLoop::Run() | Pool error event [revents:%d,errno:%d]\n",ufds[0].revents,errno);
 			//Exit
 			break;
 		}
@@ -478,46 +617,96 @@ void EventLoop::Run(const std::chrono::milliseconds &duration)
 			//Len
 			uint32_t fromLen = sizeof(from);
 			//Leemos del socket
-			int len = recvfrom(fd,data,size,MSG_DONTWAIT,(sockaddr*)&from,&fromLen);
-			//Run callback
-			if (listener) listener->OnRead(ufds[0].fd,data,len,ntohl(from.sin_addr.s_addr),ntohs(from.sin_port));
+			ssize_t len = recvfrom(fd,data,size,MSG_DONTWAIT,(sockaddr*)&from,&fromLen);
+			//If error
+			if (len<=0)
+				UltraDebug("-EventLoop::Run() | recvfrom error [len:%d,errno:%d\n",len,errno);
+			//If we got listener
+			else if (listener)
+				//Run callback
+				listener->OnRead(ufds[0].fd,data,len,ntohl(from.sin_addr.s_addr),ntohs(from.sin_port));
 		}
 		
 		//Check read is possible
 		if (ufds[0].revents & POLLOUT)
 		{
+			
 			//UltraDebug("-EventLoop::Run() | ufds[0].revents & POLLOUT\n");
 			
-			//Check if we had any pending item
-			if (!pending)
-				//Get first
-				pending = sending.try_dequeue(item);
-			
 			//Now send all that we can
-			while (pending)
+			while (items.size()<MaxMultipleSendingMessages)
 			{
-				//Create send address
-				sockaddr_in to;
-				memset(&to,0,sizeof(sockaddr_in));
-				to.sin_family	   = AF_INET;
-				to.sin_addr.s_addr = htonl(item.ipAddr);
-				to.sin_port	   = htons(item.port);
-
-				//Send it
-				int ret = sendto(fd,item.packet.GetData(),item.packet.GetSize(),MSG_DONTWAIT,(sockaddr*)&to,sizeof(to));
+				//Get current item
+				SendBuffer item;
 				
-				//It we have an error
-				if (ret<0 && state==State::Normal)
-				{
-					//Do we need to retry current packet?
-					pending = errno==EAGAIN || errno==EWOULDBLOCK;
-					//Retry again later
-					break;
-				}
 				//Get next item
-				pending = sending.try_dequeue(item);
+				if (!sending.try_dequeue(item))
+					break;
+				
+				//Move
+				items.emplace_back(std::move(item));
 			}
 			
+			//actual messages dequeued
+			uint32_t len = 0;
+			
+			//For each item
+			for (auto& item : items)
+			{
+				//Send addres
+				sockaddr_in& to		= tos[len];
+				to.sin_family		= AF_INET;
+				to.sin_addr.s_addr	= htonl(item.ipAddr);
+				to.sin_port		= htons(item.port);
+
+				//IO buffer
+				auto& iov		= iovs[len];
+				iov[0].iov_base		= item.packet.GetData();
+				iov[0].iov_len		= item.packet.GetSize();
+
+				//Message
+				msghdr& message		= messages[len].msg_hdr;
+				message.msg_name	= (sockaddr*) & to;
+				message.msg_namelen	= sizeof (to);
+				message.msg_iov		= iov;
+				message.msg_iovlen	= 1;
+				message.msg_control	= 0;
+				message.msg_controllen	= 0;
+				
+				//Reset message len
+				messages[len].msg_len	= 0;
+				
+				//Next
+				len++;
+			}
+			
+			//Send them
+			sendmmsg(fd, messages, len, flags);
+			
+			//First
+			auto it = items.begin();
+			//check each mesasge
+			for (uint32_t i = 0; i<len && it!=items.end(); ++i)
+				//If we are in normal state and we can retry a failed message
+				if (!messages[i].msg_len && state==State::Normal && (errno==EAGAIN || errno==EWOULDBLOCK))
+				{
+					//Keep
+					it++;
+				} else {
+#ifdef MSG_ZEROCOPY_ENABLED				
+					//Check correctly sent
+					if (messages[i].msg_len && zerocopyEnabled)
+					{
+						Log("-zci sent=%u\n",zerocopyIndex);
+						//push to sending queue
+						zerocopy.try_emplace(zerocopyIndex, std::move(it->packet));
+						//Increase counter
+						zerocopyIndex++;
+					}
+#endif							
+					//Delete
+					it = items.erase(it);
+				}
 		}
 		
 		//Run queued task

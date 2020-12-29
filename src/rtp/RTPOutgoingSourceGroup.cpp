@@ -48,7 +48,7 @@ void RTPOutgoingSourceGroup::ReleasePackets(QWORD until)
 	while(it!=packets.end())
 	{
 		//Check packet time
-		if (it->second->GetTime()>until)
+		if (it->second->GetTime()>=until)
 			//Keep the rest
 			break;
 		//Delete from queue and move next
@@ -56,6 +56,28 @@ void RTPOutgoingSourceGroup::ReleasePackets(QWORD until)
 	}
 }
 
+void RTPOutgoingSourceGroup::ReleasePacketsByTimestamp(QWORD until)
+{
+	//Delete old packets
+	auto it = packets.begin();
+	//Until the end
+	while(it!=packets.end())
+	{
+		//Check packet timestamp
+		if (it->second->GetExtTimestamp()>=until)
+			//Keep the rest
+			break;
+		//Delete from queue and move next
+		packets.erase(it++);
+	}
+}
+
+void RTPOutgoingSourceGroup::ReleaseAllPackets()
+{
+	//Clear
+	packets.clear();
+}
+	
 void RTPOutgoingSourceGroup::AddPacket(const RTPPacket::shared& packet)
 {
 	//Add a clone to the rtx queue
@@ -124,26 +146,27 @@ void RTPOutgoingSourceGroup::Update()
 
 void RTPOutgoingSourceGroup::Update(QWORD now)
 {
+	//Update media
+	{
+		//Lock source
+		ScopedLock scoped(media);
+		//Update
+		media.Update(now);
+	}
 	
-	//SYNCed
+	//Update RTX
 	{
-		//Lock in scope
-                ScopedLock scope(media);
-		//Refresh instant bitrates
-		media.acumulator.Update(now);
+		//Lock source
+		ScopedLock scoped(rtx);
+		//Update
+		rtx.Update(now);
 	}
-	//SYNCde
+	
+	//Update FEC
 	{
-		//Lock in scope
-                ScopedLock scope(rtx);
-		//Refresh instant bitrates
-		rtx.acumulator.Update(now);
-	}
-	//SYNCde
-	{
-		//Lock in scope
-                ScopedLock scope(fec);
-		//Refresh instant bitrates
-		fec.acumulator.Update(now);
+		//Lock source
+		ScopedLock scoped(fec);
+		//Update
+		fec.Update(now);
 	}
 }

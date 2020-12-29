@@ -280,8 +280,17 @@ VideoFrame* VP8Encoder::EncodeFrame(BYTE *buffer,DWORD bufferSize)
 
 	//Check size
 	if (!frame)
+	{
+		VP8CodecConfig config;
 		//Create new frame
 		frame = new VideoFrame(type,262143);
+		//Disable sharing buffer on clone
+		frame->DisableSharedBufer();
+		//Allocate config
+		frame->AllocateCodecConfig(config.GetSize());
+		//Add codec config
+		config.Serialize(frame->GetCodecConfigData(),frame->GetCodecConfigSize());
+	}
 
 	//Set width and height
 	frame->SetWidth(width);

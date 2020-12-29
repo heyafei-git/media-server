@@ -38,16 +38,29 @@ public:
 				this->prefix = (BYTE*) malloc(prefixLen);
 				//Copy data
 				memcpy(this->prefix,prefix,prefixLen);
-			} else {
-				this->prefix = NULL;
 			}
-
+		}
+		RtpPacketization(RtpPacketization&& info)
+		{
+			//Store values
+			this->pos = info.GetPos();
+			this->size = info.GetSize();
+			this->prefixLen = info.GetPrefixLen();
+			//Check size
+			if (prefixLen)
+			{
+				//Allocate mem
+				this->prefix = (BYTE*) malloc(prefixLen);
+				//Copy data
+				memcpy(this->prefix,info.GetPrefixData(),prefixLen);
+			}
 		}
 		~RtpPacketization()
 		{
 			if (prefix) free(prefix);
 		}
-
+		void  SetPos(DWORD pos)	      { this->pos = pos;	}
+		void  IncPos(DWORD num)	      { this->pos += num;	}		
 		DWORD GetPos()		const { return pos;		}
 		DWORD GetSize()		const { return size;		}
 		BYTE* GetPrefixData()	const { return prefix;		}
@@ -67,13 +80,13 @@ public:
 			
 		}
 	private:
-		DWORD	pos;
-		DWORD	size;
-		BYTE*	prefix;
-		DWORD	prefixLen;
+		DWORD	pos		= 0;
+		DWORD	size		= 0;
+		BYTE*	prefix		= nullptr;
+		DWORD	prefixLen	= 0;
 	};
 
-	typedef std::vector<RtpPacketization*> RtpPacketizationInfo;
+	typedef std::vector<RtpPacketization> RtpPacketizationInfo;
 public:
 	enum Type {Audio=0,Video=1,Text=2,Unknown=-1};
 
@@ -123,34 +136,34 @@ public:
 
 	void	ClearRTPPacketizationInfo()
 	{
-		//Emtpy
-		while (!rtpInfo.empty())
-		{
-			//Delete
-			delete(rtpInfo.back());
-			//remove
-			rtpInfo.pop_back();
-		}
+		//Clear
+		rtpInfo.clear();
 	}
 	
 	void	DumpRTPPacketizationInfo() const
 	{
 		//Dump all info
 		for (const auto& info : rtpInfo)
-			info->Dump();
+			info.Dump();
 	}
 	
-	void	AddRtpPacket(DWORD pos,DWORD size,const BYTE* prefix,DWORD prefixLen)		
+	void	AddRtpPacket(DWORD pos,DWORD size,const BYTE* prefix = nullptr,DWORD prefixLen = 0)		
 	{
-		rtpInfo.push_back(new RtpPacketization(pos,size,prefix,prefixLen));
+		rtpInfo.emplace_back(pos,size,prefix,prefixLen);
 	}
 	
-	Type	GetType() const		{ return type;	}
-	DWORD	GetTimeStamp() const	{ return ts;	}
-	void	SetTimestamp(DWORD ts)	{ this->ts = ts; }
+	Type	GetType() const		{ return type;		}
+	QWORD	GetTimeStamp() const	{ return ts;		} //Deprecated
+	QWORD	GetTimestamp() const	{ return ts;		}
+	void	SetTimestamp(QWORD ts)	{ this->ts = ts;	}
+	QWORD	GetTime() const		{ return time;		}
+	void	SetTime(QWORD time)	{ this->time = time;	}
 	
 	DWORD	GetSSRC() const		{ return ssrc;		}
 	void	SetSSRC(DWORD ssrc)	{ this->ssrc = ssrc;	}
+	
+	QWORD GetSenderTime() const		{ return senderTime;			}
+	void  SetSenderTime(QWORD senderTime )	{ this->senderTime = senderTime;	}
 
 	bool	HasRtpPacketizationInfo() const				{ return !rtpInfo.empty();	}
 	const RtpPacketizationInfo& GetRtpPacketizationInfo() const	{ return rtpInfo;		}
@@ -165,6 +178,8 @@ public:
 
 	BYTE* GetData()				{ AdquireBuffer(); return buffer->GetData();	}
 	void SetLength(DWORD length)		{ AdquireBuffer(); buffer->SetSize(length);	}
+	
+	void DisableSharedBufer()		{ disableSharedBuffer = true;			}
 	
 	void ResetData(DWORD size = 0) 
 	{
@@ -200,6 +215,25 @@ public:
 		buffer->AppendData(data,size);
 		//Return previous pos
 		return pos;
+	}
+	
+	
+	void PrependMedia(const BYTE* data,DWORD size)
+	{
+		//Store old buffer
+		auto old = buffer;
+		//New one
+		buffer = std::make_shared<Buffer>(old->GetSize()+size);
+		//We own the payload
+		ownedBuffer = true;
+		//Append data
+		buffer->AppendData(data,size);
+		//Append data
+		buffer->AppendData(old->GetData(),old->GetSize());
+		//Move rtp packets
+		for (auto &info : rtpInfo)
+			//Move init of rtp packet
+			info.IncPos(size);
 	}
         
 	BYTE* AllocateCodecConfig(DWORD size)
@@ -239,6 +273,8 @@ public:
 		ResetData();
 		//Clear time
 		SetTimestamp((DWORD)-1);
+		SetTime(0);
+		SetDuration(0);
 	}
 	
 	bool HasCodecConfig() const		{ return configData && configSize;	}
@@ -263,18 +299,21 @@ protected:
 	}
 	
 protected:
-	Type type		= MediaFrame::Unknown;
-	DWORD ts		= (DWORD)-1;
-	DWORD ssrc		= 0;
+	Type type			= MediaFrame::Unknown;
+	QWORD ts			= (QWORD)-1;
+	QWORD time			= 0;
+	QWORD senderTime		= 0;
+	DWORD ssrc			= 0;
 	
 	std::shared_ptr<Buffer> buffer;
-	bool ownedBuffer	= false;
+	bool ownedBuffer		= false;
+	bool disableSharedBuffer	= false;
 	
-	DWORD	duration	= 0;
-	DWORD	clockRate	= 1000;
+	DWORD	duration		= 0;
+	DWORD	clockRate		= 1000;
 	
-	BYTE	*configData	= nullptr;
-	DWORD	configSize	= 0;
+	BYTE	*configData		= nullptr;
+	DWORD	configSize		= 0;
 	
 	RtpPacketizationInfo rtpInfo;
 };

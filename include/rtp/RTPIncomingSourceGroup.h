@@ -26,7 +26,8 @@ public:
 	RTPIncomingSource* GetSource(DWORD ssrc);
 	virtual void AddListener(RTPIncomingMediaStream::Listener* listener) override;
 	virtual void RemoveListener(RTPIncomingMediaStream::Listener* listener) override;
-	virtual DWORD GetMediaSSRC() override { return media.ssrc; }
+	virtual DWORD GetMediaSSRC()		override { return media.ssrc;	}
+	virtual TimeService& GetTimeService()	override { return timeService;	}
 	int AddPacket(const RTPPacket::shared &packet, DWORD size);
 	RTPIncomingSource* Process(RTPPacket::shared &packet);
 	void Bye(DWORD ssrc);
@@ -75,6 +76,9 @@ private:
 	RTPBuffer	packets;
 	Mutex		listenerMutex;
 	std::set<RTPIncomingMediaStream::Listener*>  listeners;
+	std::optional<std::vector<bool>> activeDecodeTargets;
+	std::optional<TemplateDependencyStructure> templateDependencyStructure;
+	
 	
 	WORD  rttrtxSeq	 = 0 ;
 	QWORD rttrtxTime = 0;

@@ -52,15 +52,26 @@ public:
 		frame->SetClockRate(GetClockRate());
 		//Set timestamp
 		frame->SetTimestamp(GetTimeStamp());
+		//Set time
+		frame->SetTime(GetTime());
+		frame->SetSenderTime(GetSenderTime());
 		//Set duration
 		frame->SetDuration(GetDuration());
 		//Set config
 		if (HasCodecConfig()) frame->SetCodecConfig(GetCodecConfigData(),GetCodecConfigSize());
+		//If we have disabled the shared buffer for this frame
+		if (disableSharedBuffer)
+			//Copy data
+			frame->AdquireBuffer();
+		//Check if it has rtp info
+		for (const auto& rtp : rtpInfo)
+			//Add it
+			frame->AddRtpPacket(rtp.GetPos(),rtp.GetSize(),rtp.GetPrefixData(),rtp.GetPrefixLen());
 		//Return it
 		return (MediaFrame*)frame;
 	}
 
-	AudioCodec::Type GetCodec()			{ return codec;		}
+	AudioCodec::Type GetCodec() const		{ return codec;		}
 	void	SetCodec(AudioCodec::Type codec)	{ this->codec = codec;	}
 	
 private:

@@ -21,7 +21,8 @@ ifeq ($(DEBUG),yes)
 	#SANITIZE
 	ifeq ($(SANITIZE),yes)
 		OPTS+= -fsanitize=address -fsanitize=leak -fsanitize=undefined -fno-omit-frame-pointer
-		LDFLAGS+=  -fsanitize=address -fsanitize=leak -fsanitize=undefined 
+		SANITIZEFLAGS+= -fsanitize=address -fsanitize=leak -fsanitize=undefined 
+		LDFLAGS += -fsanitize=address -fsanitize=leak -fsanitize=undefined 
 	endif
 else
 	OPTS+= -g -O3
@@ -43,7 +44,7 @@ BIN   = $(SRCDIR)/bin/$(TAG)
 ############################################
 #Objetos
 ############################################
-DEPACKETIZERSOBJ=
+DEPACKETIZERSOBJ= RTPDepacketizer.o DependencyDescriptorLayerSelector.o
 G711DIR=g711
 G711OBJ=g711.o pcmucodec.o pcmacodec.o
 
@@ -66,8 +67,8 @@ VP8OBJ=vp8encoder.o vp8decoder.o
 DEPACKETIZERSOBJ+= vp8depacketizer.o VP8LayerSelector.o
 
 VP9DIR=vp9
-VP9OBJ=
-DEPACKETIZERSOBJ+= VP9PayloadDescription.o VP9LayerSelector.o VP9Depacketizer.o
+VP9OBJ=VP9Decoder.o
+DEPACKETIZERSOBJ+= VP9PayloadDescription.o VP9LayerSelector.o VP9Depacketizer.o 
 
 GSMDIR=gsm
 GSMOBJ=gsmcodec.o
@@ -88,9 +89,9 @@ G722OBJ=g722codec.o g722_decode.o g722_encode.o
 AACDIR=aac
 AACOBJ=aacencoder.o aacdecoder.o
 
-RTP=  LayerInfo.o RTPMap.o  RTPDepacketizer.o RTPPacket.o RTPPayload.o RTPPacketSched.o RTPSmoother.o  RTPLostPackets.o RTPSource.o RTPIncomingMediaStreamMultiplexer.o RTPIncomingSource.o RTPIncomingSourceGroup.o RTPOutgoingSource.o RTPOutgoingSourceGroup.o
-RTCP= RTCPCompoundPacket.o RTCPNACK.o RTCPReceiverReport.o RTCPCommonHeader.o RTPHeader.o RTPHeaderExtension.o RTCPApp.o RTCPExtendedJitterReport.o RTCPPacket.o RTCPReport.o RTCPSenderReport.o RTCPBye.o RTCPFullIntraRequest.o RTCPPayloadFeedback.o RTCPRTPFeedback.o RTCPSDES.o 
-CORE= SRTPSession.o dtls.o OpenSSL.o RTPTransport.o  stunmessage.o crc32calc.o http.o httpparser.o avcdescriptor.o utf8.o rtpsession.o RTPStreamTransponder.o VideoLayerSelector.o remoteratecontrol.o remoterateestimator.o RTPBundleTransport.o DTLSICETransport.o PCAPFile.o PCAPReader.o PCAPTransportEmulator.o ActiveSpeakerDetector.o EventLoop.o Datachannels.o crc32c.o crc32c_sse42.o crc32c_portable.o MediaFrameListenerBridge.o SendSideBandwidthEstimation.o
+RTP=  LayerInfo.o RTPMap.o  RTPPacket.o RTPPayload.o RTPPacketSched.o  RTPLostPackets.o RTPSource.o RTPHeader.o RTPHeaderExtension.o DependencyDescriptor.o
+RTCP= RTCPCompoundPacket.o RTCPNACK.o RTCPReceiverReport.o RTCPCommonHeader.o  RTCPApp.o RTCPExtendedJitterReport.o RTCPPacket.o RTCPReport.o RTCPSenderReport.o RTCPBye.o RTCPFullIntraRequest.o RTCPPayloadFeedback.o RTCPRTPFeedback.o RTCPSDES.o 
+CORE= RTPIncomingMediaStreamDepacketizer.o RTPIncomingMediaStreamMultiplexer.o RTPIncomingSource.o RTPIncomingSourceGroup.o RTPOutgoingSource.o RTPOutgoingSourceGroup.o RTPSmoother.o SRTPSession.o dtls.o OpenSSL.o RTPTransport.o  stunmessage.o crc32calc.o http.o httpparser.o avcdescriptor.o utf8.o rtpsession.o RTPStreamTransponder.o VideoLayerSelector.o remoteratecontrol.o remoterateestimator.o RTPBundleTransport.o DTLSICETransport.o PCAPFile.o PCAPReader.o PCAPTransportEmulator.o ActiveSpeakerDetector.o EventLoop.o Datachannels.o crc32c.o crc32c_sse42.o crc32c_portable.o MediaFrameListenerBridge.o SendSideBandwidthEstimation.o
 MP4= mp4streamer.o mp4recorder.o mp4player.o
 
 RTMP= rtmpparticipant.o amf.o rtmpmessage.o rtmpchunk.o rtmpstream.o rtmpconnection.o  rtmpserver.o  rtmpflvstream.o flvrecorder.o flvencoder.o rtmppacketizer.o
@@ -111,13 +112,16 @@ endif
 OBJSMCU = $(OBJS) main.o
 OBJSBASE = ${CORE} ${RTP} ${RTCP} $(DEPACKETIZERSOBJ) 
 OBJSLIB = ${CORE} ${RTP} ${RTCP} $(DEPACKETIZERSOBJ) $(MP4)
-OBJSTEST = $(OBJS) test/main.o test/test.o test/h264.o test/aac.o test/cpim.o test/rtp.o test/fec.o test/overlay.o test/vp8.o test/vp9.o
+OBJSTEST = $(OBJS) test/main.o test/test.o test/ddls.o test/dd.o test/h264.o test/aac.o test/cpim.o test/rtp.o test/fec.o test/overlay.o test/vp8.o test/vp9.o test/stun.o test/rtmp.o
+OBJSFUZZ = ${RTP} ${RTCP} fuzz/fuzz.o
 
 
+BUILDOBJS = $(addprefix $(BUILD)/,$(OBJS))
 BUILDOBJSMCU = $(addprefix $(BUILD)/,$(OBJSMCU))
 BUILDOBJSBASE  = $(addprefix $(BUILD)/,$(OBJSBASE))
 BUILDOBJOBJSLIB = $(addprefix $(BUILD)/,$(OBJSLIB))
 BUILDOBJSTEST= $(addprefix $(BUILD)/,$(OBJSTEST))
+BUILDOBJSFUZZ= $(addprefix $(BUILD)/,$(OBJSFUZZ))
 
 
 ###################################
@@ -148,7 +152,7 @@ VPATH +=  %.cpp $(SRCDIR)/ext/libdatachannels/src
 VPATH +=  %.cc  $(SRCDIR)/ext/crc32c/src/
 
 
-INCLUDE+= -I$(SRCDIR)/src -I$(SRCDIR)/include/ $(VADINCLUDE) -I$(SRCDIR)/ext/libdatachannels/src -I$(SRCDIR)/ext/libdatachannels/src/internal -I$(SRCDIR)/ext/crc32c/include -I$(SRCDIR)/ext/crc32c/config/${OS}-${PLATFORM}/
+INCLUDE+= -I/usr/local/include -I$(SRCDIR)/src -I$(SRCDIR)/include/ $(VADINCLUDE) -I$(SRCDIR)/ext/libdatachannels/src -I$(SRCDIR)/ext/libdatachannels/src/internal -I$(SRCDIR)/ext/crc32c/include -I$(SRCDIR)/ext/crc32c/config/${OS}-${PLATFORM}/
 
 ifeq ($(STATIC_OPENSSL),yes)
 	INCLUDE+= -I$(OPENSSL_DIR)/include
@@ -195,7 +199,7 @@ ifeq ($(STATIC),yes)
 	LDFLAGS+=/usr/local/src/libvpx/libvpx.a
 	LDFLAGS+=/usr/local/lib/
 else
-	LDFLAGS+= -lavcodec -lswscale -lavformat -lavutil -lavresample  -lmp4v2 -lspeex -lvpx -lopus  -lx264 
+	LDFLAGS+= -lavcodec -lswscale -lavformat -lavutil -lavresample  -lspeex -lvpx -lopus  -lx264 
 endif
 
 LDFLAGS+= -lgsm -lxmlrpc -lxmlrpc_xmlparse -lxmlrpc_xmltok -lxmlrpc_abyss -lxmlrpc_server -lxmlrpc_util -lnsl -lz -ljpeg -lpng -lresolv -L/lib/i386-linux-gnu -lgcrypt -lpthread -ldl
@@ -229,6 +233,7 @@ touch:
 mkdirs:
 	mkdir -p $(BUILD)
 	mkdir -p $(BUILD)/test
+	mkdir -p $(BUILD)/fuzz
 	mkdir -p $(BIN)
 ifeq ($(wildcard $(BIN)/logo.png), )
 	cp $(SRCDIR)/logo.png $(BIN)
@@ -255,12 +260,17 @@ mcu: $(OBJSMCU)
 	$(CXX) -o $(BIN)/$@ $(BUILDOBJSMCU) $(LDFLAGS) $(VADLD)
 	@echo [OUT] $(TAG) $(BIN)/$@
 	
-buildtest: $(OBJSTEST)
+buildtest: touch mkdirs $(OBJSTEST)
 	$(CXX) -o $(BIN)/test $(BUILDOBJSTEST) $(LDFLAGS) $(VADLD) 
+
+buildfuzz: touch mkdirs $(OBJSFUZZ)
+	$(CXX) -o $(BIN)/fuzz $(BUILDOBJSFUZZ) $(SANITIZEFLAGS)
 	
 test: buildtest
 	$(BIN)/$@ -lavcodec
 
+fuzz: buildfuzz
+	$(BIN)/$@ 
 
 bwe: bwe.o $(OBJSBASE) 
 	$(CXX) -o $(BIN)/$@ $(BUILDOBJSBASE) $(LDLIBFLAGS) $(addprefix $(BUILD)/,$@.o)
@@ -272,10 +282,13 @@ receiver: receiver.o $(OBJSBASE)
 	$(CXX) -o $(BIN)/$@ $(BUILDOBJSBASE) $(LDLIBFLAGS) $(addprefix $(BUILD)/,$@.o)
 	
 libmediaserver.so: touch mkdirs $(OBJSLIB)
-	$(CXX) -shared -o $(BIN)/$@ $(BUILDOBJOBJSLIB) ${LDLIBFLAGS}
+	$(CXX) -shared -o $(BIN)/$@ $(BUILDOBJOBJSLIB) $(LDLIBFLAGS)
 	@echo [OUT] $(TAG) $(BIN)/$@
 
 libmediaserver.a: touch mkdirs $(OBJSLIB)
-	${AR} rsc  $(BIN)/$@ $(BUILDOBJOBJSLIB)
+	${AR} rsc  $(BIN)/$@ $(BUILDOBJOBJSLIB) 
 	@echo [OUT] $(TAG) $(BIN)/$@
  
+libmediamixer.a: touch mkdirs $(OBJS)
+	${AR} rsc  $(BIN)/$@ $(BUILDOBJS)
+	@echo [OUT] $(TAG) $(BIN)/$@

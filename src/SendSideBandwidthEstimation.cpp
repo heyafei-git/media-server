@@ -3,210 +3,29 @@
 #include <cmath>
 #include "SendSideBandwidthEstimation.h"
 
-constexpr uint64_t kStartupDuration		= 15E5;		// 1.5 s
-constexpr uint64_t kMonitorDuration		= 500E3;	// 500ms
+constexpr uint64_t kStartupDuration		= 1E6;		// 1s
+constexpr uint64_t kStartupTargetBitrate	= 512000;	// 512kbps
+constexpr uint64_t kMonitorDuration		= 250E3;	// 250ms
 constexpr uint64_t kMonitorTimeout		= 750E3;	// 750ms
+constexpr uint64_t kLongTermDuration		= 60E6;		// 60s
 constexpr uint64_t kMinRate			= 128E3;	// 128kbps
 constexpr uint64_t kMaxRate			= 100E6;	// 100mbps
-constexpr uint64_t kMinRateChangeBps		= 4000;
-constexpr uint64_t kConversionFactor		= 100;
-constexpr double   kSamplingStep		= 0.05;
-
-// Utility function parameters.
-constexpr double kDelayGradientCoefficient = 900;
-constexpr double kLossCoefficient = 11.35;
-constexpr double kThroughputPower = 0.9;
+constexpr uint64_t kMinRateChangeBps		= 16000;
+constexpr double   kSamplingStep		= 0.0005f;
 
 
-bool MonitorInterval::SentPacket(uint64_t sent, uint64_t size, bool probing, bool rtx)
-{
-	//Check it is from this interval
-	if (sent<start || sent>GetEndTime())
-		//Skip
-		return false; //Error("-MonitorInterval::SentPacket() Skip %llu [start:%llu,end:%llu]\n",sent,start,GetEndTime());
-	//Check first
-	if (firstSent == std::numeric_limits<uint64_t>::max())
-		firstSent = sent;
-	//Set last
-	lastSent = sent;
-	//Append size
-	accumulatedSentSize += size;
-	//One more
-	totalSentPackets++;
-	
-	//Check type
-	if (probing)
-		accumulatedSentProbingSize += size;
-	else if (rtx)
-		accumulatedSentRTXSize += size;
-	else 
-		accumulatedSentMediaSize += size;
-	
-	//Log("-MonitorInterval::SentPacket() adding %llu size=%llu [start:%llu,end:%llu,acu=%llu]\n",sent,size,start,GetEndTime(),accumulatedSentSize);
-	//Accepted
-	return true;
-}
+SendSideBandwidthEstimation::SendSideBandwidthEstimation() : 
+		rttAcumulator(kLongTermDuration,1E6),
+		deltaAcumulator(kMonitorDuration,1E6),
+		totalSentAcumulator(kMonitorDuration,1E6),
+		mediaSentAcumulator(kMonitorDuration,1E6),
+		rtxSentAcumulator(kMonitorDuration,1E6),
+		probingSentAcumulator(kMonitorDuration,1E6),
+		totalRecvAcumulator(kMonitorDuration,1E6),
+		mediaRecvAcumulator(kMonitorDuration,1E6),
+		rtxRecvAcumulator(kMonitorDuration,1E6),
+		probingRecvAcumulator(kMonitorDuration,1E6)
 
-bool MonitorInterval::Feedback(uint64_t sent, uint64_t recv, uint64_t size, int64_t delta, bool probing, bool rtx)
-{
-	//Check it is from this interval 
-	if (sent<start)
-		//Skip packet
-		return false; //Error("-MonitorInterval::Feedback() Skip %llu [start:%llu,end:%llu]\n",sent,start,GetEndTime());
-	// Here we assume that if some packets are reordered with packets sent
-	// after the end of the monitor interval, then they are lost. (Otherwise
-	// it is not clear how long should we wait for packets feedback to arrive).
-	if (sent > GetEndTime())
-	{
-		//Completed
-		feedbackCollectionDone = true;
-		//Skip
-		return false; //Error("-MonitorInterval::Feedback() done, skipping %llu [start:%llu,end:%llu]\n",sent,start,GetEndTime());
-	}
-
-	//One more
-	totalFeedbackedPackets++;
-	
-	//Check recv time
-	if (recv!=std::numeric_limits<uint64_t>::max())
-	{
-		//Check first
-		if (firstRecv == std::numeric_limits<uint64_t>::max())
-			//Its first
-			firstRecv = recv;
-		//Set last
-		lastRecv = recv;
-		//Increase accumulated received sie
-		accumulatedReceivedSize += size;
-		//Check type
-		if (probing)
-			accumulatedReceivedMediaSize += size;
-		else if (rtx)
-			accumulatedReceivedRTXSize += size;
-		else 
-			accumulatedReceivedMediaSize += size;
-		//Store deltas
-		deltas.emplace_back(sent,delta);
-	} else {
-		//Increase number of packets losts
-		lostPackets ++;
-	}
-	
-	//Log("-MonitorInterval::Feedback() %llu size=%llu [start:%llu,end:%llu,acu=%llu]\n",sent,size,start,GetEndTime(),accumulatedReceivedSize);
-	
-	//Accepted
-	return true;
-}
-
-uint64_t MonitorInterval::GetSentBitrate() const
-{
-	return lastSent!=firstSent ? (accumulatedSentSize * 8E6) / (lastSent - firstSent) : 0; 
-}
-
-uint64_t MonitorInterval::GetSentEffectiveBitrate() const
-{
-	return lastSent!=firstSent ? ((accumulatedSentSize - accumulatedSentRTXSize)  * 8E6) / (lastSent - firstSent) : 0; 
-}
-
-uint64_t MonitorInterval::GetSentMediaBitrate() const
-{
-	return lastSent!=firstSent ? (accumulatedSentMediaSize * 8E6) / (lastSent - firstSent) : 0; 
-}
-
-uint64_t MonitorInterval::GetSentProbingBitrate() const
-{
-	return lastSent!=firstSent ? (accumulatedSentProbingSize * 8E6) / (lastSent - firstSent) : 0; 
-}
-
-uint64_t MonitorInterval::GetSentRTXBitrate() const
-{
-	return lastSent!=firstSent ? (accumulatedSentRTXSize * 8E6) / (lastSent - firstSent) : 0; 
-}
-
-uint64_t MonitorInterval::GetReceivedBitrate() const
-{
-	return lastRecv!=firstRecv ? (accumulatedReceivedSize * 8E6) / (lastRecv - firstRecv) : 0; 
-}
-
-uint64_t MonitorInterval::GetReceivedMediaBitrate() const
-{
-	return lastRecv!=firstRecv ? (accumulatedReceivedMediaSize * 8E6) / (lastRecv - firstRecv) : 0; 
-}
-
-uint64_t MonitorInterval::GetReceivedProbingBitrate() const
-{
-	return lastRecv!=firstRecv ? (accumulatedReceivedProbingSize * 8E6) / (lastRecv - firstRecv) : 0; 
-}
-
-uint64_t MonitorInterval::GetReceivedRTXBitrate() const
-{
-	return lastRecv!=firstRecv ? (accumulatedReceivedRTXSize * 8E6) / (lastRecv - firstRecv) : 0; 
-}
-
-double MonitorInterval::GetLossRate() const
-{
-	return totalFeedbackedPackets ? static_cast<double> (lostPackets) / totalFeedbackedPackets : 0;
-}
-
-
-// For the formula used in computations see formula for "slope" in the second method:
-// https://www.johndcook.com/blog/2008/10/20/comparing-two-ways-to-fit-a-line-to-data/
-double MonitorInterval::ComputeDelayGradient() const
-{
-	double timeSum = 0;
-	double delaySum = 0;
-	for (const auto& delta : deltas)
-	{
-		double timeDelta = delta.first;
-		double delay = delta.second;
-		timeSum += timeDelta;
-		delaySum += delay;
-	}
-	double squaredScaledTimeDeltaSum = 0;
-	double scaledTimeDeltaDelay = 0;
-	for (const auto& delta : deltas)
-	{
-		double timeDelta = delta.first;
-		double delay = delta.second;
-		double scaledTimeDelta = timeDelta - timeSum / deltas.size();
-		squaredScaledTimeDeltaSum += scaledTimeDelta * scaledTimeDelta;
-		scaledTimeDeltaDelay += scaledTimeDelta * delay;
-	}
-	return squaredScaledTimeDeltaSum ? scaledTimeDeltaDelay / squaredScaledTimeDeltaSum : 0;
-}
-
-double MonitorInterval::ComputeVivaceUtilityFunction() const 
-{
-	// Get functio inputs
-	double bitrate		= GetSentEffectiveBitrate();
-	double lossrate		= GetLossRate();
-	double delayGradient	= ComputeDelayGradient();
-	//Calculate the utility
-	return std::pow(bitrate, kThroughputPower) - (kDelayGradientCoefficient * delayGradient * bitrate) - (kLossCoefficient * lossrate * bitrate);
-}
-
-void MonitorInterval::Dump() const
-{
-	Log("[MonitorInterval from=%llu to=%llu duration=%llu target=%lubps sent=%llubps recv=%llubps firstSent=%llu lastSent=%llu firstRecv=%llu lastRecv=%llu sentSize=%llu recvSize=%llu totalSent=%lu totalFeedbacked=%lu lost=%lu done=%d/]\n",
-		start,
-		GetEndTime(),
-		duration,
-		target,
-		GetSentBitrate(),
-		GetReceivedBitrate(),
-		firstSent,
-		lastSent,
-		firstRecv,
-		lastRecv,
-		accumulatedSentSize,
-		accumulatedReceivedSize,
-		totalSentPackets,
-		totalFeedbackedPackets,
-		lostPackets,
-		feedbackCollectionDone);
-}
-
-SendSideBandwidthEstimation::SendSideBandwidthEstimation()
 {
 }
 
@@ -218,42 +37,42 @@ SendSideBandwidthEstimation::~SendSideBandwidthEstimation()
 		close(fd);
 }
 	
-void SendSideBandwidthEstimation::SentPacket(const PacketStats::shared& stats)
+void SendSideBandwidthEstimation::SentPacket(const PacketStats::shared& stat)
 {
-	
 	//Check first packet sent time
 	if (!firstSent)
-	{
 		//Set first time
-		firstSent = stats->time;
-		//Create initial interval
-		monitorIntervals.emplace_back(0,kStartupDuration);
-	}
-	//Get sent time
-	uint64_t sentTime = stats->time-firstSent;
+		firstSent = stat->time;
 	
-	//Log("sent #%u sent:%.8lu\n",stats->transportWideSeqNum,sentTime);
-	
-	//For all intervals
-	for (auto& interval : monitorIntervals)
-		//Pas it
-		interval.SentPacket(sentTime, stats->size, stats->probing, stats->rtx);
-	
-	//Check if last interval has already expired 
-	if (sentTime > (monitorIntervals.back().GetEndTime() + rtt + kMonitorTimeout))
+	//Add sent total
+	totalSentAcumulator.Update(stat->time,stat->size);
+
+	//Check type
+	if (stat->probing)
 	{
-		//Calculate new estimation
-		EstimateBandwidthRate();
-		//ReCreate new intervals again
-		CreateIntervals(sentTime);
+		//Update accumulators
+		probingSentAcumulator.Update(stat->time,stat->size);
+		rtxSentAcumulator.Update(stat->time);
+		mediaSentAcumulator.Update(stat->time);
+	} else if (stat->rtx) {
+		//Update accumulators
+		probingSentAcumulator.Update(stat->time);
+		rtxSentAcumulator.Update(stat->time,stat->size);
+		mediaSentAcumulator.Update(stat->time);
+	} else {
+		//Update accumulators
+		probingSentAcumulator.Update(stat->time);
+		rtxSentAcumulator.Update(stat->time);
+		mediaSentAcumulator.Update(stat->time,stat->size);
 	}
 	
 	//Add to history map
-	transportWideSentPacketsStats[stats->transportWideSeqNum] = stats;
+	transportWideSentPacketsStats[stat->transportWideSeqNum] = stat;
+	
 	//Protect against missfing feedbacks, remove too old lost packets
 	auto it = transportWideSentPacketsStats.begin();
 	//If there are no intervals for them
-	while(it!=transportWideSentPacketsStats.end() && (stats->time-firstSent)<monitorIntervals.front().GetStartTime())
+	while(it!=transportWideSentPacketsStats.end() && it->second->time+rtt+kMonitorTimeout<stat->time)
 		//Erase it and move iterator
 		it = transportWideSentPacketsStats.erase(it);
 
@@ -266,6 +85,28 @@ void SendSideBandwidthEstimation::ReceivedFeedback(uint8_t feedbackNum, const st
 	if (packets.empty())
 		//Skip
 		return;
+	
+	//TODO: How to handle lost feedback packets?
+	
+	//Get last packets stats
+	auto last = transportWideSentPacketsStats.find(packets.rbegin()->first);
+	//We can use the difference between the last send packet time and the reception of the fb packet as proxy of the rtt min 
+	if (last!=transportWideSentPacketsStats.end())
+	{
+		//Get stats
+		const auto& stat = last->second;
+		//Get sent time
+		const auto sentTime = stat->time;
+
+		//Double check
+		if (when>sentTime)
+		{
+			//Calculate rtt proxy, it is guaranteed to be bigger than rtt
+			uint64_t rtt = (when - sentTime)/1000;
+			//Update min
+			rttAcumulator.Update(when,rtt);
+		}
+	}
 	
 	//For each packet
 	for (const auto& feedback : packets)
@@ -286,10 +127,7 @@ void SendSideBandwidthEstimation::ReceivedFeedback(uint8_t feedbackNum, const st
 			
 			//Check first feedback received
 			if (!firstRecv)
-			{
-				prevSent = sentTime;
-				prevRecv = firstRecv = receivedTime;
-			}
+				firstRecv = receivedTime;
 			
 			//Correc ts
 			uint64_t fb   = when - firstSent;
@@ -300,41 +138,48 @@ void SendSideBandwidthEstimation::ReceivedFeedback(uint8_t feedbackNum, const st
 			uint64_t deltaRecv = receivedTime ? recv - prevRecv : 0;
 			int64_t  delta = receivedTime ? deltaRecv - deltaSent : 0;
 			
+			//Accumulate delta
+			accumulatedDelta += delta;
+			
+			//Check if we have reached bottom
+			if (accumulatedDelta<0)
+				//Reset
+				accumulatedDelta = 0;
 			//Dump stats
-			//Log("recv #%u sent:%.8lu (+%.6lu) recv:%.8lu (+%.6lu) delta:%.6ld fb:%u, size:%u, bwe:%lu\n",transportSeqNum,sent,deltaSent,recv,deltaRecv,delta,feedbackNum, stat->size, bandwidthEstimation);
+			//Log("recv #%u sent:%.8lu (+%.6lu) recv:%.8lu (+%.6lu) delta:%.6ld fb:%u, size:%u, bwe:%lu accumulateDelta:%lld\n",transportSeqNum,sent,deltaSent,recv,deltaRecv,delta,feedbackNum, stat->size, bandwidthEstimation, accumulatedDelta);
 			
-			bool completed = true;
-			//For all intervals
-			for (auto& interval : monitorIntervals)
-			{
-				//Pas it
-				interval.Feedback(sent,receivedTime? recv : std::numeric_limits<uint64_t>::max(),stat->size,delta,stat->probing,stat->rtx);
-				//Check if they are completed
-				completed &= interval.IsFeedbackCollectionDone();
-			}
-			
-			//If all intervals are completed now
-			if (completed)
-			{
-				//Calculate new estimation
-				EstimateBandwidthRate();
-				//Create new intervals
-				CreateIntervals(sent);
-			}
-
 			//If dumping to file
 			if (fd)
 			{
 				char msg[1024];
 				//Create log
-				int len = snprintf(msg,1024,"%.8lu|%u|%u|%u|%lu|%lu|%lu|%lu|%ld|%u|%u|%u|%u|%d|%d|%d\n",fb,transportSeqNum,feedbackNum, stat->size,sent,recv,deltaSent,deltaRecv,delta,GetEstimatedBitrate(),GetTargetBitrate(),GetAvailableBitrate(),rtt,stat->mark,stat->rtx,stat->probing);
+				int len = snprintf(msg,1024,"%.8lu|%u|%hhu|%u|%lu|%lu|%lu|%lu|%ld|%u|%u|%u|%u|%d|%d|%d\n",fb,transportSeqNum,feedbackNum, stat->size,sent,recv,deltaSent,deltaRecv,delta,GetEstimatedBitrate(),GetTargetBitrate(),GetAvailableBitrate(),rtt,stat->mark,stat->rtx,stat->probing);
 				//Write it
 				write(fd,msg,len);
 			}
-
+			
 			//Check if it was not lost
 			if (receivedTime)
 			{
+				//Add receive total
+				totalRecvAcumulator.Update(receivedTime,stat->size);
+
+				//Check type
+				if (stat->probing)
+				{
+					probingRecvAcumulator.Update(receivedTime,stat->size);
+					rtxRecvAcumulator.Update(receivedTime);
+					mediaRecvAcumulator.Update(receivedTime);
+				} else if (stat->rtx) {
+					probingRecvAcumulator.Update(receivedTime);
+					rtxRecvAcumulator.Update(receivedTime,stat->size);
+					mediaRecvAcumulator.Update(receivedTime);
+				} else {
+					probingRecvAcumulator.Update(receivedTime);
+					rtxRecvAcumulator.Update(receivedTime);
+					mediaRecvAcumulator.Update(receivedTime,stat->size);
+				}
+			
 				//Update last received time
 				lastRecv = receivedTime;
 				//And previous
@@ -344,172 +189,171 @@ void SendSideBandwidthEstimation::ReceivedFeedback(uint8_t feedbackNum, const st
 
 			//Erase it
 			transportWideSentPacketsStats.erase(it);
+		} else {
+			//Log
+			Warning("-SendSideBandwidthEstimation::ReceivedFeedback() | Packet not found [transportSeqNum:%u,receivedTime:%llu]\n",transportSeqNum,receivedTime);
 		}
 	}
+	
+	//Calculate new estimation
+	EstimateBandwidthRate(when);
 }
 
-void SendSideBandwidthEstimation::UpdateRTT(uint32_t rtt)
+void SendSideBandwidthEstimation::UpdateRTT(uint64_t when, uint32_t rtt)
 {
 	//Store rtt
 	this->rtt = rtt;
 	//Smooth
-	//rttTracker.UpdateRtt(rtt);
+	rttAcumulator.Update(when,rtt);
 }
 
 uint32_t SendSideBandwidthEstimation::GetEstimatedBitrate() const
 {
 	return bandwidthEstimation;
 }
+
 uint32_t SendSideBandwidthEstimation::GetAvailableBitrate() const
 {
 	return availableRate;
 }
 
+uint32_t SendSideBandwidthEstimation::GetMinRTT() const
+{
+	//If we have any value
+	if (!rttAcumulator.IsEmpty())
+		//Get min value over long period
+		return rttAcumulator.GetMinValueInWindow();
+	//Return last, must be possitive
+	return rtt;
+}
+
 uint32_t SendSideBandwidthEstimation::GetTargetBitrate() const
 {
-	//Find current interval
-	for (const auto& interval : monitorIntervals)
-		//If is not completed yet
-		if (!interval.IsFeedbackCollectionDone())
-			//This is the current target
-			return interval.GetTargetBitrate();
-	return bandwidthEstimation;
+	return std::min(std::max(targetBitrate,kMinRate),kMaxRate);
+	
 }
 
-
-void SendSideBandwidthEstimation::CreateIntervals(uint64_t time)
+void SendSideBandwidthEstimation::SetState(ChangeState state)
 {
-	//Log("-SendSideBandwidthEstimation::CreateIntervals() [time:%llu]\n",time);
-	
-	//Drop previous ones
-	monitorIntervals.clear();
-	
-	//Ramdomize if we have to increase or decrease rate first
-	int64_t sign = 2 * (std::rand() % 2) - 1;
-	
-	//Calculate step
-	uint64_t step = std::max(static_cast<uint64_t>(bandwidthEstimation * kSamplingStep),kMinRateChangeBps);
-
-	//Calculate probing btirates for monitors
-	uint64_t monitorIntervalsBitrates[2] = {
-		std::min(bandwidthEstimation  + sign * step, kMaxRate),
-		std::max(bandwidthEstimation  - sign * step, kMinRate)
-	};
-	
-	//Create two consecutive monitoring intervals
-	monitorIntervals.emplace_back(monitorIntervalsBitrates[0], time, kMonitorDuration);
-	monitorIntervals.emplace_back(monitorIntervalsBitrates[1], time + kMonitorDuration, kMonitorDuration);
-	
-	//For all packets with still no feedback
-	for (const auto& entry : transportWideSentPacketsStats)
-	{
-		//Get sent time
-		uint64_t sentTime = entry.second->time - firstSent;
-		uint64_t size = entry.second->size;
-		//For all new intervals
-		for (auto& interval : monitorIntervals)
-			//Pas it
-			interval.SentPacket(sentTime, size, entry.second->probing, entry.second->rtx);
-	}
-	
+	//Set number of consecutive chantes
+	if (this->state == state)
+		consecutiveChanges++;
+	else 
+		consecutiveChanges = 0;
+	//Store new state
+	this->state = state;
 }
 
-void SendSideBandwidthEstimation::EstimateBandwidthRate()
+void SendSideBandwidthEstimation::EstimateBandwidthRate(uint64_t when)
 {
 	//Log("-SendSideBandwidthEstimation::EstimateBandwidthRate()\n");
 	
-	if (monitorIntervals.empty())
-		return;
-	
-//	for (const auto& interval : monitorIntervals)
-//		interval.Dump();
-	
-	//If startup phase completed
-	if (monitorIntervals.size()==1)
-	{
-		//Calculate initial value based on received data so far
-		availableRate = bandwidthEstimation = monitorIntervals[0].GetReceivedBitrate();
-		//Log it
-		//Log("-SendSideBandwidthEstimation::EstimateBandwidthRate() [estimate:%llubps]\n",bandwidthEstimation);
-		//Set new extimate
-		if (listener)
-			listener->onTargetBitrateRequested(availableRate);
-		//Done
-		return;
-	}
 
-	//Get deltas gradients
-//	double delta0	= monitorIntervals[0].ComputeDelayGradient();
-//	double delta1	= monitorIntervals[1].ComputeDelayGradient();
-	//Calcualte utilities for each interval
-	double utility0 = monitorIntervals[0].ComputeVivaceUtilityFunction();
-	double utility1 = monitorIntervals[1].ComputeVivaceUtilityFunction();
-	//Get actual sent rate
-	double bitrate0 = std::max(monitorIntervals[0].GetSentEffectiveBitrate(),monitorIntervals[0].GetTargetBitrate());
-	double bitrate1 = std::max(monitorIntervals[1].GetSentEffectiveBitrate(),monitorIntervals[1].GetTargetBitrate());
-	//Get sizes
-	uint64_t mediaSize = monitorIntervals[0].GetSentMediaBitrate() + monitorIntervals[1].GetSentMediaBitrate();
-	uint64_t rtxSize   = monitorIntervals[0].GetSentRTXBitrate() + monitorIntervals[1].GetSentRTXBitrate();
-	//Get actual target bitrate
-	uint64_t targetBitrate = bitrate0 && bitrate1 ? (bitrate0 + bitrate1) / 2 : bitrate0 + bitrate1;
-	
-	//The utility gradient
-	double gradient = (utility0 - utility1) / (bitrate0 - bitrate1);
-	
-	//Get previous state change
-	auto prevState = state;
 
-	//Check if we have sent much more than expected
-	if (targetBitrate>std::max(monitorIntervals[0].GetTargetBitrate(),monitorIntervals[1].GetTargetBitrate()))
+	//Get current estimated rtt
+	uint32_t rttMin		= GetMinRTT();
+	int32_t rttEstimated	= rttMin + accumulatedDelta/1000;
+	
+	//Get bitrates
+	uint64_t totalRecvBitrate	= totalRecvAcumulator.GetInstantAvg() * 8;
+	uint64_t totalSentBitrate	= totalSentAcumulator.GetInstantAvg() * 8;
+	uint64_t rtxSentBitrate		= rtxSentAcumulator.GetInstantAvg() * 8;
+	
+	//Check none of then is 0 or if delay has increased too much
+	if (rttMin && rttEstimated>(50+rttMin*1.5))
 	{
+		//We are in congestion
+		SetState(ChangeState::Congestion);
+		//Set bwe as received rate
+		bandwidthEstimation = totalRecvBitrate;
+	} else if (mediaSentAcumulator.GetInstantAvg()*8>targetBitrate) {
 		//We are overshooting
-		state = ChangeState::OverShoot;
-		//Update target bitrate to max received
-		targetBitrate = std::max(monitorIntervals[0].GetReceivedBitrate(),monitorIntervals[1].GetReceivedBitrate());
-	} else
-		//Get state from gradient
-		state = gradient ? ChangeState::Increase : ChangeState::Decrease;
-
-	//Set bumber of consecutive chantes
-	if (prevState == state && state!=ChangeState::OverShoot)
-		consecutiveChanges++;
-	else
-		consecutiveChanges = 0;
+		SetState(ChangeState::OverShoot);
+		//Take maximum of the spike and current value
+		bandwidthEstimation = std::max<uint64_t>(bandwidthEstimation, totalRecvBitrate);
+	} else {
+		//We are going to increase rate again
+		SetState(ChangeState::Increase);
+		
+		//Initial conversion factor
+		double confidenceAmplifier = 1+std::log(consecutiveChanges+1);
+		//Get rate change
+		int64_t rateChange = std::max<uint64_t>(totalSentBitrate * confidenceAmplifier * kSamplingStep,kMinRateChangeBps);
+		
+		//Set it, don't allow more than a 2x rate chante
+		bandwidthEstimation = std::max(bandwidthEstimation, totalSentBitrate - rtxSentBitrate + std::min<int64_t>(rateChange,totalSentBitrate));
+	}
 	
-	//Initial conversion factor
-	double confidenceAmplifier = 1+std::log(consecutiveChanges+1);
-	//Get rate change
-	int64_t rateChange = gradient * confidenceAmplifier * kConversionFactor;
-	//Set it
-	bandwidthEstimation = targetBitrate + rateChange;
-	
-	//Adjust max/min rates
+	//Set min/max limits
 	bandwidthEstimation = std::min(std::max(bandwidthEstimation,kMinRate),kMaxRate);
 	
-	//Get loss rate
-	double lossRate = std::max(monitorIntervals[0].GetLossRate(),monitorIntervals[1].GetLossRate());
-	//Corrected rate
-	bandwidthEstimation = bandwidthEstimation * ( 1 - lossRate);
-	//Available rate
-	availableRate = rtxSize ? bandwidthEstimation * mediaSize / (mediaSize + rtxSize) : bandwidthEstimation;
+	//Corrected rate based on loss
+	//bandwidthEstimation = bandwidthEstimation * ( 1.0f - lossRate);
 	
-//	Log("-SendSideBandwidthEstimation::EstimateBandwidthRate() [estimate:%llubps,available:%llubps,target:%llubps,bitrate0:%llubps,bitrate1:%llubps,utility0:%f,utility1:%f,gradient:%f,rate:%lld,state:%d\n",
+	//If rtt increasing
+	if (accumulatedDelta> 0)
+		//Adapt to rtt slope
+		targetBitrate = bandwidthEstimation * (1.0f - static_cast<double>(accumulatedDelta) / (accumulatedDelta  + kMonitorDuration));
+	else
+		//Try to reach bwe
+		targetBitrate = bandwidthEstimation;
+	
+	//Calculate rtx overhead
+	double overhead = rtxSentAcumulator.GetAcumulated() && mediaSentAcumulator.GetAcumulated() ?  static_cast<double>(mediaSentAcumulator.GetAcumulated()) / (mediaSentAcumulator.GetAcumulated() + rtxSentAcumulator.GetAcumulated()) : 1.0f;
+
+	//Available rate taking into account current rtx overhead
+	availableRate = targetBitrate * overhead; 
+
+	//Set min/max limits
+	availableRate = std::min(std::max(availableRate,kMinRate),kMaxRate);
+
+
+//	Log("-SendSideBandwidthEstimation::EstimateBandwidthRate() [estimate:%llubps,target:%llubps,available:%llubps,sent:%llubps,recv:%llubps,rtx=%llubps,state:%d,delta=%d,media:%u,rtx:%d,overhead:%f\n",
 //		bandwidthEstimation,
 //		targetBitrate,
 //		availableRate,
-//		static_cast<uint64_t>(bitrate0),
-//		static_cast<uint64_t>(bitrate1),
-//		utility0,
-//		utility1,
-//		gradient,
-//		rateChange,
-//		state
+//		totalSentBitrate,
+//		totalRecvBitrate,
+//		rtxSentBitrate,
+//		state,
+//		static_cast<int32_t>(accumulatedDelta/1000),
+//		mediaSentAcumulator.GetAcumulated(),
+//		rtxSentAcumulator.GetAcumulated(),
+//		overhead
 //	);
+
+	//Check we have listener
+	if (!listener)
+		return;
 	
-	//Set new extimate
-	if (listener)
+	//Check when we have to trigger a new bwe change on the app
+	if (
+		//If it is the first congestion
+		(state == ChangeState::Congestion && consecutiveChanges == 0) ||
+		//If not overshooting and las bwe was not too long ago
+		(state != ChangeState::OverShoot && lastChange + kStartupDuration < when)
+	)
+	{
+//		Log("-SendSideBandwidthEstimation::EstimateBandwidthRate() [estimate:%llubps,target:%llubps,available:%llubps,sent:%llubps,recv:%llubps,rtx=%llubps,state:%d,delta=%d,media:%u,rtx:%d,overhead:%f,when:%llu,diff:%llu\n",
+//			bandwidthEstimation,
+//			targetBitrate,
+//			availableRate,
+//			totalSentBitrate,
+//			totalRecvBitrate,
+//			rtxSentBitrate,
+//			state,
+//			static_cast<int32_t>(accumulatedDelta/1000),
+//			mediaSentAcumulator.GetAcumulated(),
+//			rtxSentAcumulator.GetAcumulated(),
+//			overhead,
+//			when,
+//			when - lastChange
+//		);
 		//Call listener	
 		listener->onTargetBitrateRequested(availableRate);
+		//Upddate last changed time
+		lastChange = when;
+	}
 }
 
 int SendSideBandwidthEstimation::Dump(const char* filename) 
@@ -519,12 +363,32 @@ int SendSideBandwidthEstimation::Dump(const char* filename)
 		//Error
 		return 0;
 	
-	Log("-SendSideBandwidthEstimation::Dump [\"%s\"]\n",filename);
+	Log("-SendSideBandwidthEstimation::Dump() [\"%s\"]\n",filename);
 	
 	//Open file
 	if ((fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0600))<0)
 		//Error
 		return false; //Error("Could not open file [err:%d]\n",errno);
+
+	//Done
+	return 1;
+}
+
+int SendSideBandwidthEstimation::StopDump() 
+{
+	//If not already dumping
+	if (fd==FD_INVALID)
+		//Error
+		return 0;
+	
+	Log("-SendSideBandwidthEstimation::StopDump()\n");
+	
+	
+	//Close file
+	close(fd);
+	
+	//No dump
+	fd=FD_INVALID;
 
 	//Done
 	return 1;

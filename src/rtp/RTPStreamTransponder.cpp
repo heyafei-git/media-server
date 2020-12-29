@@ -1,19 +1,7 @@
-/*
- * To change this license header, choose License Headers in Project Properties.
- * To change this template file, choose Tools | Templates
- * and open the template in the editor.
- */
-
-/* 
- * File:   RTPStreamTransponder.cpp
- * Author: Sergio
- * 
- * Created on 20 de abril de 2017, 18:33
- */
-
 #include "rtp/RTPStreamTransponder.h"
 #include "waitqueue.h"
 #include "vp8/vp8.h"
+#include "DependencyDescriptorLayerSelector.h"
 
 
 RTPStreamTransponder::RTPStreamTransponder(RTPOutgoingSourceGroup* outgoing,RTPSender* sender) :
@@ -64,6 +52,8 @@ bool RTPStreamTransponder::SetIncoming(RTPIncomingMediaStream* incoming, RTPRece
 		
 		//Request update on the incoming
 		if (this->receiver) this->receiver->SendPLI(this->incoming->GetMediaSSRC());
+		//Update last requested PLI
+		lastSentPLI = getTime();
 	}
 	
 	Debug("<RTPStreamTransponder::SetIncoming() | [incoming:%p,receiver:%p]\n",incoming,receiver);
@@ -142,10 +132,10 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 			RTPPacket::shared rtp = std::make_shared<RTPPacket>(media,codec);
 			//Set data
 			rtp->SetPayloadType(type);
-			rtp->SetSSRC(source);
+			rtp->SetSSRC(ssrc);
 			rtp->SetExtSeqNum(lastExtSeqNum++);
 			rtp->SetMark(true);
-			rtp->SetTimestamp(lastTimestamp);
+			rtp->SetExtTimestamp(lastTimestamp);
 			//Send it
 			if (sender) sender->Enqueue(rtp);
 		}
@@ -158,8 +148,9 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 		//Store the last send ones
 		baseExtSeqNum = lastExtSeqNum+1;
 		baseTimestamp = lastTimestamp;
-		//None dropped
+		//None dropped or added
 		dropped = 0;
+		added = 0;
 		//Not selecting
 		selector = nullptr;
 		//No layer
@@ -186,7 +177,7 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 			//Get timestamp diff on correct clock rate
 			QWORD diff = offset*packet->GetClockRate()/1000;
 			
-			//UltraDebug("-ts offset:%llu diff:%llu baseTimestap:%lu firstTimestamp:%lu lastTimestamp:%llu rate:%llu\n",offset,diff,baseTimestamp,firstTimestamp,lastTimestamp,packet->GetClockRate());
+			//UltraDebug("-ts offset:%llu diff:%llu baseTimestap:%lu firstTimestamp:%llu lastTimestamp:%llu rate:%llu\n",offset,diff,baseTimestamp,firstTimestamp,lastTimestamp,packet->GetClockRate());
 			
 			//convert it to rtp time and add to the last sent timestamp
 			baseTimestamp = lastTimestamp + diff + 1;
@@ -201,9 +192,9 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 		//Reset drop counter
 		dropped = 0;
 		//Get first timestamp
-		firstTimestamp = packet->GetTimestamp();
+		firstTimestamp = packet->GetExtTimestamp();
 		
-		UltraDebug("-StreamTransponder::onRTP() | first seq:%lu base:%lu last:%lu ts:%lu baseSeq:%lu baseTimestamp:%llu lastTimestamp:%llu\n",firstExtSeqNum,baseExtSeqNum,lastExtSeqNum,firstTimestamp,baseExtSeqNum,baseTimestamp,lastTimestamp);
+		UltraDebug("-StreamTransponder::onRTP() | first seq:%lu base:%lu last:%lu ts:%llu baseSeq:%lu baseTimestamp:%llu lastTimestamp:%llu\n",firstExtSeqNum,baseExtSeqNum,lastExtSeqNum,firstTimestamp,baseExtSeqNum,baseTimestamp,lastTimestamp);
 	}
 	
 	//Ensure it is not before first one
@@ -212,7 +203,7 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 		return;
 	
 	//Only for viedo
-	if (packet->GetMedia()==MediaFrame::Video)
+	if (packet->GetMediaType()==MediaFrame::Video)
 	{
 		//Check if we don't have one or if we have a selector and it is not from the same codec
 		if (!selector || (BYTE)selector->GetCodec()!=packet->GetCodec())
@@ -240,6 +231,10 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 		{
 			//One more dropperd
 			dropped++;
+			//If selector is waiting for intra and last PLI was more than 1s ago
+			if (selector->IsWaitingForIntra() && getTimeDiff(lastSentPLI)>1E6)
+				//Request it again
+				RequestPLI();
 			//Drop
 			return;
 		}
@@ -247,22 +242,25 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 		lastSpatialLayerId = selector->GetSpatialLayer();
 	}
 	
-	
-	
 	//Set normalized seq num
-	extSeqNum = baseExtSeqNum + (extSeqNum - firstExtSeqNum) - dropped;
+	extSeqNum = baseExtSeqNum + (extSeqNum - firstExtSeqNum) - dropped + added;
 	
 	//Set normailized timestamp
-	uint64_t timestamp = baseTimestamp + (packet->GetTimestamp()-firstTimestamp);
+	uint64_t timestamp = baseTimestamp + (packet->GetExtTimestamp()-firstTimestamp);
 	
-	//UltraDebug("-ext seq:%lu base:%lu first:%lu current:%lu dropped:%lu ts:%lu normalized:%llu\n",extSeqNum,baseExtSeqNum,firstExtSeqNum,packet->GetExtSeqNum(),dropped,packet->GetTimestamp(),timestamp);
+	//UPdate media codec and type
+	media = packet->GetMediaType();
+	codec = packet->GetCodec();
+	type  = packet->GetPayloadType();
+	
+	//UltraDebug("-ext seq:%lu base:%lu first:%lu current:%lu dropped:%lu added:%d ts:%lu normalized:%llu intra:%d codec=%d\n",extSeqNum,baseExtSeqNum,firstExtSeqNum,packet->GetExtSeqNum(),dropped,added,packet->GetTimestamp(),timestamp,packet->IsKeyFrame(),codec);
 	
 	//Rewrite pict id
 	bool rewitePictureIds = false;
 	DWORD pictureId = 0;
 	DWORD temporalLevelZeroIndex = 0;
 	//TODO: this should go into the layer selector??
-	if (rewritePicId && packet->GetCodec()==VideoCodec::VP8 && packet->vp8PayloadDescriptor)
+	if (rewritePicId && codec==VideoCodec::VP8 && packet->vp8PayloadDescriptor)
 	{
 		//Get VP8 desc
 		auto desc = *packet->vp8PayloadDescriptor;
@@ -285,17 +283,48 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 			tl0Idx++;
 		}
 		
-		//Rewrite picture id wrapping to 15 or 7 bits
-		pictureId = desc.pictureIdLength==2 ? picId%0x7FFF : picId%0x7F;
+		//Rewrite picture id
+		pictureId = picId;
 		//Rewrite tl0 index
 		temporalLevelZeroIndex = tl0Idx;
 		//We need to rewrite vp8 picture ids
 		rewitePictureIds = true;
 	}
-	//UPdate media codec and type
-	media = packet->GetMedia();
-	codec = packet->GetCodec();
-	type  = packet->GetPayloadType();
+	
+	//If we have to append h264 sprop parameters set for the first packet of an iframe
+	if (h264Parameters && codec==VideoCodec::H264 && packet->IsKeyFrame() && (timestamp!=lastTimestamp || firstExtSeqNum==packet->GetExtSeqNum()))
+	{
+		//UltraDebug("-addding h264 sprop\n");
+		
+		//Clone packet
+		auto cloned = h264Parameters->Clone();
+		//Set new seq numbers
+		cloned->SetExtSeqNum(extSeqNum);
+		//Set normailized timestamp
+		cloned->SetExtTimestamp(timestamp);
+		//Set payload type
+		cloned->SetPayloadType(type);
+		//Change ssrc
+		cloned->SetSSRC(ssrc);
+		//Send packet
+		if (sender)
+			//Create clone on sender thread
+			sender->Enqueue(cloned);
+		//Add new packet
+		added ++;
+		extSeqNum ++;
+		
+		//UltraDebug("-ext seq:%lu base:%lu first:%lu current:%lu dropped:%lu added:%d ts:%lu normalized:%llu intra:%d codec=%d\n",extSeqNum,baseExtSeqNum,firstExtSeqNum,packet->GetExtSeqNum(),dropped,added,packet->GetTimestamp(),timestamp,packet->IsKeyFrame(),codec);
+	}
+	
+	//Dependency descriptor active decodte target mask
+	std::optional<std::vector<bool>> forwaredDecodeTargets;
+	
+	//If it is AV1
+	if (codec==VideoCodec::AV1)
+		//Get decode target
+		forwaredDecodeTargets = static_cast<DependencyDescriptorLayerSelector*>(selector.get())->GetForwardedDecodeTargets();
+	
 	//Get last send seq num and timestamp
 	lastExtSeqNum = extSeqNum;
 	lastTimestamp = timestamp;
@@ -321,11 +350,15 @@ void RTPStreamTransponder::onRTP(RTPIncomingMediaStream* stream,const RTPPacket:
 			//Ensure we have desc
 			if (cloned->vp8PayloadDescriptor)
 			{
-				//Rewrite picture id wrapping to 15 or 7 bits
+				//Rewrite picture id
 				cloned->vp8PayloadDescriptor->pictureId = pictureId;
 				//Rewrite tl0 index
 				cloned->vp8PayloadDescriptor->temporalLevelZeroIndex = temporalLevelZeroIndex;
 			}
+			//If it has a dependency descriptor
+			if (forwaredDecodeTargets && cloned->HasTemplateDependencyStructure())
+				//Override mak
+				cloned->OverrideActiveDecodeTargets(forwaredDecodeTargets);
 			//Move it
 			return std::move(cloned);
 		});
@@ -367,6 +400,8 @@ void RTPStreamTransponder::RequestPLI()
 	ScopedLock lock(mutex);
 	//Request update on the incoming
 	if (receiver && incoming) receiver->SendPLI(incoming->GetMediaSSRC());
+	//Update last sent pli
+	lastSentPLI = getTime();
 }
 
 void RTPStreamTransponder::onPLIRequest(RTPOutgoingSourceGroup* group,DWORD ssrc)
@@ -402,4 +437,67 @@ void RTPStreamTransponder::Mute(bool muting)
 		RequestPLI();
 	//Update state
 	muted = muting;
+}
+
+bool RTPStreamTransponder::AppendH264ParameterSets(const std::string& sprop)
+{
+	
+	Debug("-RTPStreamTransponder::AppendH264ParameterSets() [sprop:%s]\n",sprop.c_str());
+	
+	//Create pakcet
+	auto rtp = std::make_shared<RTPPacket>(MediaFrame::Video,VideoCodec::H264);
+	
+	//Get current length
+	BYTE* data = rtp->AdquireMediaData();
+	DWORD len = 0;
+	DWORD size = rtp->GetMaxMediaLength();
+	//Append stap-a header
+	data[len++] = 24;
+	//Split by ","
+	auto start = 0;
+	
+	//Get next separator
+	auto end = sprop.find(',');
+	
+	//Parse
+	while(end!=std::string::npos)
+	{
+		//Get prop
+		auto prop = sprop.substr(start,end-start);
+		
+		Debug("-RTPStreamTransponder::AppendH264ParameterSets() [sprop:%s]\n",prop.c_str());
+		//Parse and keep space for size
+		auto l = av_base64_decode(data+len+2,prop.c_str(),size-len-2);
+		//Check result
+		if (l<=0)
+			return Error("-RTPStreamTransponder::AppendH264ParameterSets() could not decode base64 data [%s]\n",prop.c_str());
+		//Set naly length
+		set2(data,len,l);
+		//Increase length
+		len += l+2;
+		//Next
+		start = end+1;
+		//Get nest
+		end = sprop.find(',',start);
+	}
+	//last one
+	auto prop = sprop.substr(start,end-start);
+	
+	//Parse and keep space for size
+	auto l = av_base64_decode(data+len+2,prop.c_str(),size-len-2);
+	//Check result
+	if (l<=0)
+		return Error("-RTPStreamTransponder::AppendH264ParameterSets() could not decode base64 data [%s]\n",prop.c_str());
+	//Set naly length
+	set2(data,len,l);
+	//Increase length
+	len += l+2;
+	//Set new lenght
+	rtp->SetMediaLength(len);
+	
+	//Store it
+	this->h264Parameters = rtp;
+	
+	//Done
+	return true;
 }

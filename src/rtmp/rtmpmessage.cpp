@@ -90,8 +90,14 @@ RTMPMessage::RTMPMessage(DWORD streamId,QWORD timestamp,Type type,DWORD length)
 				media = new RTMPVideoFrame(timestamp,length);
 			break;
 		default:
-			std::runtime_error("RTMP Message not supported");
+			//Throw exception
+			throw std::runtime_error("RTMP Message not supported");
 	}
+	
+	//Check size of control messages,except for UserControlMessage that can have 2 different sizes
+	if (ctrl && type!=UserControlMessage && ctrl->GetSize()!=length)
+		//Throw exception
+		throw std::runtime_error("Wrong size for control message");
 
 	//Init position
 	pos = 0;
@@ -271,7 +277,12 @@ DWORD RTMPMessage::Parse(BYTE* data,DWORD size)
 	DWORD len = size;
 
 	//Get reamining data
-	DWORD left = length - pos;
+	DWORD left = GetLeft();
+	
+	//Check if have consumed all input but still we are not parsed
+	if (!left && !IsParsed())
+		//Throw exception
+		throw std::runtime_error("Wrong size for message");
 
 	//Check sizes
 	if (len > left)
@@ -334,6 +345,11 @@ DWORD RTMPMessage::Parse(BYTE* data,DWORD size)
 		pos +=len;
 		//Check if we have finished
 		parsing = (pos!=length);
+	} else {
+		//Skip 
+		pos +=len;
+		//Check if we have finished
+		parsing = (pos!=length);
 	}
 
 	return len;
@@ -342,6 +358,11 @@ DWORD RTMPMessage::Parse(BYTE* data,DWORD size)
 bool RTMPMessage::IsParsed()
 {
 	return !parsing;
+}
+
+DWORD RTMPMessage::GetLeft()
+{
+	return length - pos;
 }
 
 bool RTMPMessage::IsControlProtocolMessage()
@@ -451,6 +472,24 @@ RTMPCommandMessage::RTMPCommandMessage(const wchar_t* name,QWORD transId,AMFData
 		this->extra.push_back(extra);
 }
 
+RTMPCommandMessage::RTMPCommandMessage(const wchar_t* name,QWORD transId,AMFData* params,const std::vector<AMFData*>& extra)
+{
+	//Set name
+	this->name = new AMFString();
+	this->name->SetWString(name);
+	//Set transId
+	this->transId = new AMFNumber();
+	this->transId->SetNumber(transId);
+	//Store objects
+	if (params)
+	    //Store object
+	    this->params = params;
+	else
+	    //Create null object
+	    this->params = new AMFNull();
+	//If extra
+	this->extra = extra;
+}
 
 RTMPCommandMessage::~RTMPCommandMessage()
 {
@@ -476,6 +515,9 @@ DWORD RTMPCommandMessage::Parse(BYTE *data,DWORD size)
 	{
 		//Parse amf object
 		DWORD len = parser.Parse(buffer,bufferSize);
+		//If not parsed
+		if (!len)
+			return 0;
 
 		//Remove used data
 		buffer += len;
@@ -515,11 +557,13 @@ void RTMPCommandMessage::Dump()
 {
 	AMFNull null;
 
-	Debug("[RTMPCommandMessage name:%ls transId:%d]\n",name->GetWString().c_str(),(DWORD)transId->GetNumber());
+	Debug("[RTMPCommandMessage name:%ls transId:%d]\n",name ? name->GetWString().c_str() : L"<null>" ,transId ? (DWORD)transId->GetNumber() : 0);
+	
 	if (params)
 		params->Dump();
 	else
 		null.Dump();
+	
 	for(DWORD i=0;i<extra.size();i++)
 	{
 		//Get object
@@ -627,6 +671,20 @@ DWORD RTMPCommandMessage::GetSize()
 	//Return lengt
 	return len;
 }
+
+RTMPCommandMessage* RTMPCommandMessage::Clone() const 
+{
+	std::vector<AMFData*> extras;
+	for (auto ext : extra)
+		extras.push_back(ext ? ext->Clone() : nullptr);
+	
+	return new RTMPCommandMessage(
+		name->GetWChar(),
+		transId->GetNumber(),
+		params ? params->Clone() : nullptr,
+		extras
+	);
+}
 /************************
  * RTMPMetaData
  *
@@ -668,6 +726,10 @@ DWORD RTMPMetaData::Parse(BYTE *data,DWORD size)
 	{
 		//Parse amf object
 		DWORD len = parser.Parse(buffer,bufferSize);
+		
+		//If not parsed
+		if (!len)
+			return 0;
 
 		//Remove used data
 		buffer += len;

@@ -14,10 +14,10 @@
 class Acumulator
 {
 public:
-	Acumulator(DWORD window)
+	Acumulator(DWORD window, DWORD base = 1000) :
+		window(window),
+		base(base)
 	{
-		this->window  = window;
-		instant = 0;
 		Reset(0);
 	}
 
@@ -30,10 +30,10 @@ public:
 	bool  IsInWindow()		const { return inWindow;			}
 	bool  IsInMinMaxWindow()	const { return inWindow && min!=(QWORD)-1;	}
 	long double GetInstantMedia()	const { return GetCount() ? GetInstant()/GetCount() : 0;	}
-	long double GetInstantAvg()	const { return GetInstant()*1000/GetWindow();	}
-	long double GetAverage()	const { return GetDiff() ? GetAcumulated()*1000/GetDiff() : 0;	}
-	long double GetMinAvg()		const { return GetMin()*1000/GetWindow();	}
-	long double GetMaxAvg()		const { return GetMax()*1000/GetWindow();	}
+	long double GetInstantAvg()	const { return GetInstant()*base/GetWindow();			}
+	long double GetAverage()	const { return GetDiff() ? GetAcumulated()*base/GetDiff() : 0;	}
+	long double GetMinAvg()		const { return GetMin()*base/GetWindow();			}
+	long double GetMaxAvg()		const { return GetMax()*base/GetWindow();			}
 
 	void ResetMinMax()
 	{
@@ -43,12 +43,15 @@ public:
 
 	void Reset(QWORD now)
 	{
+		instant = 0;
 		acumulated = 0;
 		max = 0;
 		min = (QWORD)-1;
 		first = now;
 		last = 0;
 		inWindow = false;
+		values.clear();
+		count = 0;
 	}
 	
 	QWORD Update(QWORD now,DWORD val = 0)
@@ -59,6 +62,7 @@ public:
 		instant += val;
 		//Insert into the instant queue
 		values.emplace_back(now,val);
+		count++;
 		//Erase old values
 		while(!values.empty() && values.front().first+window<=now)
 		{
@@ -66,6 +70,7 @@ public:
 			instant -= values.front().second;
 			//Delete value
 			values.pop_front();
+			count--;
 			//We are in a window
 			inWindow = true;
 		}
@@ -115,12 +120,18 @@ public:
 	
 	DWORD GetCount() const
 	{
-		return values.size();
+		return count;
 	}
 	
+	DWORD IsEmpty() const
+	{
+		return values.empty();
+	}
 private:
 	std::list<std::pair<QWORD,DWORD>> values;
+	DWORD count;
 	DWORD window;
+	DWORD base;
 	bool  inWindow;
 	QWORD acumulated;
 	QWORD instant;
